@@ -123,8 +123,20 @@ enable_resukisu_kpm_configs() {
     CONFIG_KALLSYMS_ALL
 }
 
+enable_ftrace_debug_configs() {
+  local config_file="$1"
+  enable_config_values "$config_file" \
+    CONFIG_FUNCTION_TRACER \
+    CONFIG_DYNAMIC_FTRACE \
+    CONFIG_DEBUG_FS \
+    CONFIG_FTRACE_SYSCALLS \
+    CONFIG_STACK_TRACER
+}
+
 apply_variant_configs() {
   local config_file="$1"
+
+  enable_ftrace_debug_configs "$config_file"
 
   if [[ "$KSU_TYPE" == *susfs* ]]; then
     enable_susfs_configs "$config_file"
