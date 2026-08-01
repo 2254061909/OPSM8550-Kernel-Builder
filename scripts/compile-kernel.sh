@@ -4,9 +4,10 @@
 #   1. Set up cross-compile / ccache environment
 #   2. Apply the requested KSU variant
 #   3. Apply susfs patches (if requested)
-#   4. Generate defconfig, merge config fragments, apply variant tweaks
-#   5. Build Image
-#   6. Run post-build verifications
+#   4. Overlay KPM from SukiSU-Ultra (if KPM variant)
+#   5. Generate defconfig, merge config fragments, apply variant tweaks
+#   6. Build Image
+#   7. Run post-build verifications
 #
 # Required env (provided by the workflow):
 #   GITHUB_WORKSPACE
@@ -76,6 +77,11 @@ if [[ "$KSU_TYPE" == *susfs* ]]; then
   : "${SUSFS_PATCH_FILE:?}"
   apply_susfs_full "$SUSFS_REF" "$SUSFS_PATCH_FILE"
   verify_susfs_source_integration "${KSU_KERNEL_DIR}"
+fi
+
+# ---- KPM overlay (after susfs, before config) --------------------------------
+if [[ "$KSU_TYPE" == "ReSukiSU-with-susfs-KPM" ]]; then
+  overlay_kpm_from_sukisu
 fi
 
 touch .scmversion
