@@ -1,19 +1,5 @@
 #!/usr/bin/env bash
-#
-# Resolve workflow_dispatch inputs into a concrete build profile and export
-# environment variables + step outputs for the rest of the job.
-#
-# Required env (all provided by the workflow):
-#   INPUT_PLATFORM
-#   INPUT_SOURCE_CHOICE
-#   INPUT_BRANCH_MODE
-#   INPUT_KERNEL_BRANCH
-#   INPUT_CLANG_CHOICE
-#   MATRIX_KSU_TYPE
-#   GITHUB_ENV
-#   GITHUB_OUTPUT
-#   GITHUB_STEP_SUMMARY
-#
+# Resolve workflow_dispatch inputs into a concrete build profile.
 set -euo pipefail
 
 : "${INPUT_PLATFORM:?}"
@@ -29,6 +15,16 @@ INPUT_KERNEL_BRANCH="${INPUT_KERNEL_BRANCH:-}"
 
 # ---- Platform ----------------------------------------------------------------
 case "$INPUT_PLATFORM" in
+  "Xiaomi ingres (SM8450 / Redmi K50G / POCO F4 GT)")
+    SOC="sm8450"
+    PLATFORM_SLUG="ingres"
+    PLATFORM_NAME="Xiaomi ingres (SM8450)"
+    # Xiaomi ingres defconfig stack lives entirely inside the kernel tree.
+    BUILD_CONFIGS="vendor/waipio_GKI.config vendor/xiaomi_GKI.config vendor/ingres_GKI.config vendor/debugfs.config"
+    OFFICIAL_BUILD_TARGET="waipio"
+    OFFICIAL_GKI_FRAGMENT="arch/arm64/configs/vendor/ingres_GKI.config"
+    RECOMMENDED_SOURCE="IngresCentre"
+    ;;
   "Snapdragon 8 Gen 1 (SM8450 / OnePlus 10T / Ace Pro)")
     SOC="sm8450"
     PLATFORM_SLUG="8gen1"
@@ -63,6 +59,14 @@ case "$INPUT_PLATFORM" in
 esac
 
 # ---- Source preset -----------------------------------------------------------
+# ingres layout: single kernel tree (device trees + defconfig fragments in-tree),
+# NO separate -modules repo. We reuse the vendor_dlkm modules already on device.
+if [[ "$PLATFORM_SLUG" == "ingres" ]]; then
+  SOURCE_LAYOUT="ingres-flat"
+  KERNEL_SOURCE="IngresCentre"
+  SOURCE_NAME="Ingres-Centre (Xiaomi ingres)"
+  SOURCE_SLUG="ingres-centre"
+else
 case "$INPUT_SOURCE_CHOICE" in
   "Recommended source for this platform")
     KERNEL_SOURCE="$RECOMMENDED_SOURCE"
@@ -108,6 +112,7 @@ case "$KERNEL_SOURCE" in
   "crdroidandroid")         SOURCE_NAME="crDroid";                       SOURCE_SLUG="crdroid" ;;
   "OnePlus12R-development") SOURCE_NAME="OnePlus 12R development";       SOURCE_SLUG="oneplus12r-dev" ;;
 esac
+fi
 
 # ---- Clang preset ------------------------------------------------------------
 case "$INPUT_CLANG_CHOICE" in
@@ -129,7 +134,12 @@ SUSFS_REF=""
 SUSFS_PATCH_FILE=""
 
 # ---- Repo layout -------------------------------------------------------------
-if [[ "$SOURCE_LAYOUT" == "oneplus-official" ]]; then
+if [[ "$SOURCE_LAYOUT" == "ingres-flat" ]]; then
+  KERNEL_REPO="https://github.com/Ingres-Centre/android_kernel_xiaomi_sm8450.git"
+  MODULES_REPO=""
+  KERNEL_CLONE_DIR="${SOC}"
+  MODULES_CLONE_DIR=""
+elif [[ "$SOURCE_LAYOUT" == "oneplus-official" ]]; then
   KERNEL_REPO="https://github.com/${KERNEL_SOURCE}/android_kernel_oneplus_${SOC}.git"
   MODULES_REPO="https://github.com/${KERNEL_SOURCE}/android_kernel_modules_and_devicetree_oneplus_${SOC}.git"
   KERNEL_CLONE_DIR="${SOC}-modules/kernel_platform/msm-kernel"
@@ -143,7 +153,11 @@ fi
 
 # ---- Branch resolution -------------------------------------------------------
 if [[ "$INPUT_BRANCH_MODE" == "Use the recommended branch automatically" ]]; then
-  KERNEL_BRANCH="$(git ls-remote --symref "$KERNEL_REPO" HEAD | awk '/^ref:/ {sub("refs/heads/","",$2); print $2; exit}')"
+  if [[ "$SOURCE_LAYOUT" == "ingres-flat" ]]; then
+    KERNEL_BRANCH="lineage-23.0"
+  else
+    KERNEL_BRANCH="$(git ls-remote --symref "$KERNEL_REPO" HEAD | awk '/^ref:/ {sub("refs/heads/","",$2); print $2; exit}')"
+  fi
   if [[ -z "$KERNEL_BRANCH" ]]; then
     echo "::error::Could not detect the default branch from $KERNEL_REPO"
     exit 1
@@ -173,7 +187,7 @@ if [[ -z "$CLANG_VERSION" ]]; then
       CLANG_VERSION="clang-r563880c" ;;
     *)
       CLANG_VERSION="clang-r563880c"
-      echo "::warning::Could not confidently infer the best clang version for branch '$KERNEL_BRANCH'. Falling back to $CLANG_VERSION."
+      echo "::warning::Could not confidently infer clang for '$KERNEL_BRANCH'. Falling back to $CLANG_VERSION."
       ;;
   esac
 fi
@@ -181,28 +195,15 @@ fi
 # ---- susfs reference ---------------------------------------------------------
 if [[ "$KSU_TYPE" == *susfs* ]]; then
   case "$SOC" in
-    sm8450)
-      SUSFS_REF="gki-android13-5.10"
-      ;;
+    sm8450) SUSFS_REF="gki-android13-5.10" ;;
     sm8550)
       case "$KERNEL_BRANCH" in
         lineage-20*|thirteen*|android13*|13.*|oneplus/*_t_13*|oneplus_*_t_13*)
           SUSFS_REF="gki-android13-5.15" ;;
-        lineage-21*|lineage-22*|lineage-23*|fourteen*|fifteen*|sixteen*|android14*|android15*|android16*|14.*|15.*|16.*|oneplus/*_u_14*|oneplus/*_v_15*|oneplus/*_b_16*|oneplus_*_u_14*|oneplus_*_v_15*|oneplus_*_b_16*)
-          SUSFS_REF="gki-android14-5.15" ;;
-        *)
-          SUSFS_REF="gki-android14-5.15"
-          echo "::warning::Could not confidently infer the best SM8550 susfs branch for '$KERNEL_BRANCH'. Falling back to $SUSFS_REF."
-          ;;
-      esac
-      ;;
-    sm8650)
-      SUSFS_REF="gki-android14-6.1"
-      ;;
-    *)
-      echo "::error::No susfs mapping is configured for platform $SOC"
-      exit 1
-      ;;
+        *) SUSFS_REF="gki-android14-5.15" ;;
+      esac ;;
+    sm8650) SUSFS_REF="gki-android14-6.1" ;;
+    *) echo "::error::No susfs mapping for $SOC"; exit 1 ;;
   esac
   SUSFS_PATCH_FILE="50_add_susfs_in_${SUSFS_REF}.patch"
 fi
@@ -213,27 +214,13 @@ if ! git ls-remote --exit-code --heads "$KERNEL_REPO" "$KERNEL_BRANCH" >/dev/nul
   exit 1
 fi
 
-if ! git ls-remote --exit-code --heads "$MODULES_REPO" "$KERNEL_BRANCH" >/dev/null 2>&1; then
-  echo "::error::Branch '$KERNEL_BRANCH' was not found in $MODULES_REPO"
-  echo "::error::This workflow requires the matching modules repository for defconfig/Kconfig resolution."
-  exit 1
+# ingres layout has no separate modules repo; skip that check.
+if [[ "$SOURCE_LAYOUT" != "ingres-flat" ]]; then
+  if ! git ls-remote --exit-code --heads "$MODULES_REPO" "$KERNEL_BRANCH" >/dev/null 2>&1; then
+    echo "::error::Branch '$KERNEL_BRANCH' was not found in $MODULES_REPO"
+    exit 1
+  fi
 fi
-
-case "$KERNEL_SOURCE" in
-  OnePlusOSS)
-    if [[ ! "$KERNEL_BRANCH" =~ ^oneplus/ ]] && [[ ! "$KERNEL_BRANCH" =~ ^oneplus_ ]]; then
-      echo "::warning::This source usually uses oneplus/* branches, but '$KERNEL_BRANCH' was selected."
-    fi
-    ;;
-  LineageOS|OnePlus12R-development|lineage-ovaltine-dev)
-    if [[ ! "$KERNEL_BRANCH" =~ ^lineage- ]]; then
-      echo "::warning::This source usually uses lineage-* branches, but '$KERNEL_BRANCH' was selected."
-    fi
-    ;;
-  crdroidandroid)
-    echo "Note: crDroid branch naming may differ from LineageOS."
-    ;;
-esac
 
 # ---- Export to GITHUB_ENV ----------------------------------------------------
 {
@@ -279,7 +266,5 @@ esac
   echo "- Branch: $KERNEL_BRANCH"
   echo "- Clang: $CLANG_VERSION"
   echo "- Root solution: $KSU_TYPE"
-  if [[ -n "$SUSFS_REF" ]]; then
-    echo "- susfs branch: $SUSFS_REF"
-  fi
+  [[ -n "$SUSFS_REF" ]] && echo "- susfs branch: $SUSFS_REF"
 } >> "$GITHUB_STEP_SUMMARY"
