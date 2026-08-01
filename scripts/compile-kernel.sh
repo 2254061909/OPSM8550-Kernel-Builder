@@ -92,7 +92,39 @@ apply_variant_configs arch/arm64/configs/gki_defconfig
 make O=out gki_defconfig ${ACTIVE_BUILD_CONFIGS}
 
 apply_variant_configs out/.config
+
+# ---- susfs OPEN_REDIRECT compatibility guard --------------------------------
+# The susfs gki-android13-5.10 patch enables CONFIG_KSU_SUSFS_OPEN_REDIRECT by
+# default (default y in KernelSU Kconfig). That feature injects 4-argument
+# set_nameidata(nd, old_dfd, fake_filename, NULL) calls into fs/namei.c, but the
+# stock 5.10.245 tree here defines the standard 3-argument set_nameidata(). The
+# mismatch breaks the build ("too many arguments to function call, expected 3,
+# have 4"). OPEN_REDIRECT is an optional, rarely-used path-redirect feature; all
+# core susfs hiding features (SUS_PATH / SUS_MOUNT / SUS_KSTAT / SPOOF_UNAME /
+# SPOOF_CMDLINE, etc.) are unaffected. Disable it so the kernel compiles while
+# keeping the full root-hiding capability set.
+if [[ "$KSU_TYPE" == *susfs* ]]; then
+  if [[ -x scripts/config ]]; then
+    scripts/config --file out/.config --disable KSU_SUSFS_OPEN_REDIRECT || true
+  else
+    # Fallback: normalize any enabled line to the disabled form.
+    sed -i 's/^CONFIG_KSU_SUSFS_OPEN_REDIRECT=y$/# CONFIG_KSU_SUSFS_OPEN_REDIRECT is not set/' out/.config || true
+    grep -q 'CONFIG_KSU_SUSFS_OPEN_REDIRECT' out/.config \
+      || echo '# CONFIG_KSU_SUSFS_OPEN_REDIRECT is not set' >> out/.config
+  fi
+  echo "[+] Disabled CONFIG_KSU_SUSFS_OPEN_REDIRECT (susfs 4-arg set_nameidata compat)."
+fi
+
 make O=out olddefconfig
+
+# Verify the guard actually stuck (olddefconfig could theoretically re-add it).
+if [[ "$KSU_TYPE" == *susfs* ]]; then
+  if grep -q '^CONFIG_KSU_SUSFS_OPEN_REDIRECT=y' out/.config; then
+    echo "::error::CONFIG_KSU_SUSFS_OPEN_REDIRECT is still enabled after olddefconfig; the set_nameidata mismatch would break the build."
+    exit 1
+  fi
+  echo "[+] Confirmed CONFIG_KSU_SUSFS_OPEN_REDIRECT is disabled in out/.config."
+fi
 
 # ---- Build -------------------------------------------------------------------
 ccache -z || true
