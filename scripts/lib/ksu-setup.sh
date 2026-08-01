@@ -60,6 +60,65 @@ setup_kernelsu_next() {
   setup_kernelsu_repo "KernelSU-Next" "KernelSU-Next" "$requested_ref" 1
 }
 
+# Overlay KPM support from SukiSU-Ultra onto an already-installed KSU driver.
+# Must be called AFTER susfs patches have been applied.
+overlay_kpm_from_sukisu() {
+  local driver_dir
+  driver_dir="$(detect_kernelsu_driver_dir)" || {
+    echo "::error::drivers directory not found, cannot overlay KPM"
+    exit 1
+  }
+  local ksu_kernel_dir
+  ksu_kernel_dir="$(readlink -f "${driver_dir}/kernelsu")"
+
+  echo "[+] Overlaying KPM support from SukiSU-Ultra..."
+
+  # Clone SukiSU-Ultra kernel to extract KPM files
+  rm -rf SukiSU-Ultra-kpm
+  git clone --depth=1 --no-tags -b main \
+    "https://github.com/SukiSU-Ultra/SukiSU-Ultra.git" SukiSU-Ultra-kpm
+
+  # Copy kpm/ directory into the KSU driver
+  rm -rf "${ksu_kernel_dir}/kpm"
+  cp -r SukiSU-Ultra-kpm/kernel/kpm "${ksu_kernel_dir}/kpm"
+  echo "[+] Copied kpm/ source files."
+
+  # Add KPM objects to Kbuild (before the final newline, after susfs may have added lines)
+  local kbuild="${ksu_kernel_dir}/Kbuild"
+  if ! grep -q 'kpm/kpm.o' "$kbuild"; then
+    printf '\nobj-$(CONFIG_KPM) += kpm/compact.o\n' >> "$kbuild"
+    printf 'obj-$(CONFIG_KPM) += kpm/kpm.o\n' >> "$kbuild"
+    printf 'obj-$(CONFIG_KPM) += kpm/super_access.o\n' >> "$kbuild"
+    echo "[+] Added KPM objects to Kbuild."
+  else
+    echo "[+] KPM objects already present in Kbuild."
+  fi
+
+  # Add CONFIG_KPM to Kconfig
+  local kconfig="${ksu_kernel_dir}/Kconfig"
+  if ! grep -q 'config KPM' "$kconfig"; then
+    cat >> "$kconfig" << 'KPM_KCONFIG'
+
+config KPM
+    bool "Enable SukiSU KPM"
+    depends on KSU && 64BIT
+    default n
+    help
+      Enabling this option will activate the KPM feature.
+      This option is suitable for scenarios where you need
+      to force KPM to be enabled.
+    select KALLSYMS
+    select KALLSYMS_ALL
+KPM_KCONFIG
+    echo "[+] Added CONFIG_KPM to Kconfig."
+  else
+    echo "[+] CONFIG_KPM already present in Kconfig."
+  fi
+
+  rm -rf SukiSU-Ultra-kpm
+  echo "[+] KPM overlay complete."
+}
+
 # Apply the chosen KSU preset using its upstream setup.sh / local clone flow.
 install_ksu_variant() {
   local ksu_type="$1"
@@ -78,14 +137,10 @@ install_ksu_variant() {
     "KernelSU-Next")
       setup_kernelsu_next dev
       ;;
-    "ReSukiSU"|"ReSukiSU-with-susfs")
+    "ReSukiSU"|"ReSukiSU-with-susfs"|"ReSukiSU-with-susfs-KPM")
+      # ReSukiSU works with susfs patches; KPM is overlaid later if needed.
       curl --retry 5 --retry-delay 3 --retry-all-errors -fLSs \
         "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash -s main
-      ;;
-    "ReSukiSU-with-susfs-KPM")
-      # SukiSU-Ultra's kernel has CONFIG_KPM built-in, ReSukiSU does not.
-      curl --retry 5 --retry-delay 3 --retry-all-errors -fLSs \
-        "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s main
       ;;
     *)
       echo "::error::Unsupported ksu_type: $ksu_type"
