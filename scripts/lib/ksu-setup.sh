@@ -78,9 +78,14 @@ install_ksu_variant() {
     "KernelSU-Next")
       setup_kernelsu_next dev
       ;;
-    "ReSukiSU"|"ReSukiSU-with-susfs"|"ReSukiSU-with-susfs-KPM")
+    "ReSukiSU"|"ReSukiSU-with-susfs")
       curl --retry 5 --retry-delay 3 --retry-all-errors -fLSs \
         "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash -s main
+      ;;
+    "ReSukiSU-with-susfs-KPM")
+      # SukiSU-Ultra's kernel has CONFIG_KPM built-in, ReSukiSU does not.
+      curl --retry 5 --retry-delay 3 --retry-all-errors -fLSs \
+        "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s main
       ;;
     *)
       echo "::error::Unsupported ksu_type: $ksu_type"
