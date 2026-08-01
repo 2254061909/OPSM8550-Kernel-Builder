@@ -83,13 +83,24 @@ overlay_kpm_from_sukisu() {
   cp -r SukiSU-Ultra-kpm/kernel/kpm "${ksu_kernel_dir}/kpm"
   echo "[+] Copied kpm/ source files."
 
-  # Add KPM objects to Kbuild (before the final newline, after susfs may have added lines)
+  # Copy uapi/supercall.h from SukiSU-Ultra (has KPM definitions ReSukiSU lacks)
+  cp -f SukiSU-Ultra-kpm/uapi/supercall.h "${ksu_kernel_dir}/uapi/supercall.h"
+  echo "[+] Updated uapi/supercall.h with KPM definitions."
+
+  # Fix compact.c: ReSukiSU renamed ksu_manager_appid -> ksu_last_manager_appid
+  local compact_c="${ksu_kernel_dir}/kpm/compact.c"
+  sed -i 's/ksu_manager_appid/ksu_last_manager_appid/g' "$compact_c"
+  echo "[+] Patched compact.c for ReSukiSU API compatibility."
+
+  # Add C99-compat flag for kpm source files (super_access.c uses C99 for-loops)
   local kbuild="${ksu_kernel_dir}/Kbuild"
   if ! grep -q 'kpm/kpm.o' "$kbuild"; then
-    printf '\nobj-$(CONFIG_KPM) += kpm/compact.o\n' >> "$kbuild"
+    printf '\n# KPM objects (overlay from SukiSU-Ultra)\n' >> "$kbuild"
+    printf 'obj-$(CONFIG_KPM) += kpm/compact.o\n' >> "$kbuild"
     printf 'obj-$(CONFIG_KPM) += kpm/kpm.o\n' >> "$kbuild"
     printf 'obj-$(CONFIG_KPM) += kpm/super_access.o\n' >> "$kbuild"
-    echo "[+] Added KPM objects to Kbuild."
+    printf 'subdir-ccflags-$(CONFIG_KPM) += -Wno-gcc-compat\n' >> "$kbuild"
+    echo "[+] Added KPM objects and flags to Kbuild."
   else
     echo "[+] KPM objects already present in Kbuild."
   fi
@@ -105,8 +116,6 @@ config KPM
     default n
     help
       Enabling this option will activate the KPM feature.
-      This option is suitable for scenarios where you need
-      to force KPM to be enabled.
     select KALLSYMS
     select KALLSYMS_ALL
 KPM_KCONFIG
