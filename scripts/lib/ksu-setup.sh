@@ -84,7 +84,9 @@ overlay_kpm_from_sukisu() {
   echo "[+] Copied kpm/ source files."
 
   # Copy uapi/supercall.h from SukiSU-Ultra (has KPM definitions ReSukiSU lacks)
-  cp -f SukiSU-Ultra-kpm/uapi/supercall.h "${ksu_kernel_dir}/uapi/supercall.h"
+  # ReSukiSU's include/uapi may be a symlink; write into the real include dir
+  mkdir -p "${ksu_kernel_dir}/include/uapi"
+  cp -f SukiSU-Ultra-kpm/uapi/supercall.h "${ksu_kernel_dir}/include/uapi/supercall.h"
   echo "[+] Updated uapi/supercall.h with KPM definitions."
 
   # Fix compact.c: ReSukiSU renamed ksu_manager_appid -> ksu_last_manager_appid
