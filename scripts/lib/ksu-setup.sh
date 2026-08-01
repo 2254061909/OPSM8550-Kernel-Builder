@@ -83,18 +83,39 @@ overlay_kpm_from_sukisu() {
   cp -r SukiSU-Ultra-kpm/kernel/kpm "${ksu_kernel_dir}/kpm"
   echo "[+] Copied kpm/ source files."
 
-  # Copy uapi/supercall.h from SukiSU-Ultra (has KPM definitions ReSukiSU lacks)
-  # ReSukiSU's include/uapi may be a symlink; write into the real include dir
-  mkdir -p "${ksu_kernel_dir}/include/uapi"
-  cp -f SukiSU-Ultra-kpm/uapi/supercall.h "${ksu_kernel_dir}/include/uapi/supercall.h"
-  echo "[+] Updated uapi/supercall.h with KPM definitions."
+  # Append KPM definitions to ReSukiSU's supercall.h (don't overwrite)
+  local sc_h="${ksu_kernel_dir}/include/uapi/supercall.h"
+  if [[ -f "$sc_h" ]] && ! grep -q 'SUKISU_KPM_LOAD' "$sc_h"; then
+    mkdir -p "$(dirname "$sc_h")"
+    cat >> "$sc_h" << 'KPM_DEFS'
+
+/* KPM definitions (overlay from SukiSU-Ultra) */
+static const __u32 SUKISU_KPM_LOAD = 1;
+static const __u32 SUKISU_KPM_UNLOAD = 2;
+static const __u32 SUKISU_KPM_NUM = 3;
+static const __u32 SUKISU_KPM_LIST = 4;
+static const __u32 SUKISU_KPM_INFO = 5;
+static const __u32 SUKISU_KPM_CONTROL = 6;
+static const __u32 SUKISU_KPM_VERSION = 7;
+
+struct ksu_kpm_cmd {
+    __aligned_u64 __user control_code;
+    __aligned_u64 __user arg1;
+    __aligned_u64 __user arg2;
+    __aligned_u64 __user result_code;
+};
+KPM_DEFS
+    echo "[+] Appended KPM definitions to supercall.h."
+  else
+    echo "[+] KPM definitions already in supercall.h, or file not found."
+  fi
 
   # Fix compact.c: ReSukiSU renamed ksu_manager_appid -> ksu_last_manager_appid
   local compact_c="${ksu_kernel_dir}/kpm/compact.c"
   sed -i 's/ksu_manager_appid/ksu_last_manager_appid/g' "$compact_c"
   echo "[+] Patched compact.c for ReSukiSU API compatibility."
 
-  # Add C99-compat flag for kpm source files (super_access.c uses C99 for-loops)
+  # Add C99-compat flag for kpm source files
   local kbuild="${ksu_kernel_dir}/Kbuild"
   if ! grep -q 'kpm/kpm.o' "$kbuild"; then
     printf '\n# KPM objects (overlay from SukiSU-Ultra)\n' >> "$kbuild"
