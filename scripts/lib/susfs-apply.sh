@@ -3,6 +3,11 @@
 # susfs patching helpers and the end-to-end apply routine. Sourced, not
 # executed. Depends on lib/kernel-helpers.sh.
 #
+# NOTE: compile-kernel.sh runs under `set -euo pipefail`. Several helpers here
+# probe the tree with grep/find, where "no match" is a normal outcome that
+# returns 1. Those functions disable errexit locally and restore it on exit,
+# otherwise a routine miss aborts the whole build with no message at all.
+#
 
 apply_susfs_task_mmu_fix() {
   local file="fs/proc/task_mmu.c"
@@ -38,7 +43,6 @@ patch_susfs_kernelsu_layout() {
   fi
 }
 
-# Symbol name from a declaration line.
 _decl_symbol_name() {
   local line="$1"
   if [[ "$line" == *"("* ]]; then
@@ -49,6 +53,7 @@ _decl_symbol_name() {
 }
 
 restore_includes_deleted_by_susfs_patch() {
+  set +e
   local ksu_repo_dir="$1"
   local file line restored=0
 
@@ -83,10 +88,12 @@ restore_includes_deleted_by_susfs_patch() {
   done < <(git -C "$ksu_repo_dir" diff --name-only -- '*.c' '*.h')
 
   [[ "$restored" -eq 0 ]] && echo "[i] No #include lines were removed by the patch."
+  set -e
   return 0
 }
 
 restore_declarations_deleted_from_ksu_headers() {
+  set +e
   local ksu_repo_dir="$1"
   local header line restored=0
 
@@ -132,38 +139,31 @@ restore_declarations_deleted_from_ksu_headers() {
   done < <(git -C "$ksu_repo_dir" diff --name-only -- '*.h')
 
   [[ "$restored" -eq 0 ]] && echo "[i] No declarations were removed from KSU headers."
+  set -e
   return 0
 }
 
-# ---------------------------------------------------------------------------
-# core/init.c ends up calling functions whose prototypes are no longer visible:
-# the susfs patch removed the #include lines that pulled them in, and those
-# includes did not come from a file the patch otherwise modified, so the
-# diff-based restore above cannot see them.
-#
-# Resolve it from the symbol side instead: for every function init.c calls but
-# has no declaration for, locate the header in the KSU tree that declares it and
-# add that #include. If no header declares it, fall back to a local prototype
-# (all of these are void(void) by usage).
-# ---------------------------------------------------------------------------
+# For every ksu_* function core/init.c calls without a visible declaration,
+# find the header in the tree that declares it and add that #include. Falls
+# back to a local void(void) prototype if nothing declares it.
 ensure_init_symbols_declared() {
+  set +e
   local ksu_dir="$1"
   local init_c="${ksu_dir}/core/init.c"
-  [[ -f "$init_c" ]] || return 0
+  if [[ ! -f "$init_c" ]]; then
+    set -e
+    return 0
+  fi
 
-  local sym hdr rel decl_re
+  local sym hdr rel decl_re last_inc visible
   local added_includes=() added_protos=()
-
-  # Functions called in init.c, in call syntax `name(`, that are KSU's own.
   local called
-  called="$(grep -oE '\bksu_[A-Za-z0-9_]+\(' "$init_c" | sed 's/($//;s/(//' | sort -u)"
+  called="$(grep -oE '\bksu_[A-Za-z0-9_]+\(' "$init_c" | sed 's/(//' | sort -u)"
 
   for sym in $called; do
     decl_re="^[A-Za-z_][A-Za-z0-9_[:space:]\*]*[[:space:]\*]${sym}[[:space:]]*\("
 
-    # Already declared in a header init.c includes? Cheap approximation:
-    # is it declared in any header that init.c currently includes by name.
-    local visible=0
+    visible=0
     while IFS= read -r rel; do
       [[ -z "$rel" ]] && continue
       [[ -f "${ksu_dir}/${rel}" ]] || continue
@@ -174,22 +174,18 @@ ensure_init_symbols_declared() {
     done < <(grep -oE '^#include[[:space:]]+"[^"]+"' "$init_c" | sed -E 's/.*"([^"]+)".*/\1/')
     [[ "$visible" -eq 1 ]] && continue
 
-    # Defined right here in init.c? Then no include is needed.
     grep -qE "$decl_re" "$init_c" && continue
 
-    # Find a header in the tree that declares it.
     hdr="$(grep -rlE "$decl_re" "$ksu_dir" --include='*.h' 2>/dev/null | head -n 1)"
+    last_inc="$(grep -n '^#include' "$init_c" | tail -n 1 | cut -d: -f1)"
+    [[ -z "$last_inc" ]] && continue
 
     if [[ -n "$hdr" ]]; then
       rel="${hdr#"${ksu_dir}"/}"
       grep -Fq "#include \"${rel}\"" "$init_c" && continue
-      local last_inc
-      last_inc="$(grep -n '^#include' "$init_c" | tail -n 1 | cut -d: -f1)"
       sed -i "${last_inc}a #include \"${rel}\"" "$init_c"
       added_includes+=("${sym} -> ${rel}")
     else
-      local last_inc
-      last_inc="$(grep -n '^#include' "$init_c" | tail -n 1 | cut -d: -f1)"
       sed -i "${last_inc}a void ${sym}(void);" "$init_c"
       added_protos+=("$sym")
     fi
@@ -200,26 +196,17 @@ ensure_init_symbols_declared() {
     printf '      %s\n' "${added_includes[@]}"
   fi
   if [[ "${#added_protos[@]}" -gt 0 ]]; then
-    echo "[+] Added ${#added_protos[@]} local prototype(s) to core/init.c"
-    echo "    (no header in the tree declares them):"
+    echo "[+] Added ${#added_protos[@]} local prototype(s) to core/init.c:"
     printf '      void %s(void);\n' "${added_protos[@]}"
   fi
   if [[ "${#added_includes[@]}" -eq 0 && "${#added_protos[@]}" -eq 0 ]]; then
     echo "[i] All KSU symbols used by core/init.c already have declarations."
   fi
+
+  set -e
   return 0
 }
 
-# ---------------------------------------------------------------------------
-# Known drift hunks that git apply rejects outright:
-#
-#   kernel/Kbuild        #2  deletes the x86 syscall-dispatcher block. Skipped.
-#   kernel/core/init.c   #3  swaps hook headers for the older ones. Skipped.
-#   kernel/core/init.c   #7  rewrites the init sequence; its only susfs content
-#                            is susfs_init(), which we inject exactly.
-#   kernel/policy/
-#     app_profile.h      #1  escape_to_root_for_init() void -> int. REQUIRED.
-# ---------------------------------------------------------------------------
 resolve_known_susfs_ksu_drift() {
   local ksu_repo_dir="$1"
   local ksu_dir="$2"
@@ -243,7 +230,6 @@ resolve_known_susfs_ksu_drift() {
 
       grep -q 'susfs_init();' "$init_c" || {
         echo "::error::Could not inject susfs_init() into ${init_c}."
-        grep -n 'ksu_supercalls_init\|kernelsu_init' "$init_c" | head -n 20
         exit 1
       }
       echo "[+] Injected susfs_init() into core/init.c."
