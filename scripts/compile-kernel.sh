@@ -14,6 +14,7 @@
 #   GITHUB_WORKSPACE CLANG_VERSION SOC BUILD_CONFIGS SOURCE_LAYOUT
 #   OFFICIAL_BUILD_TARGET KSU_TYPE KERNEL_BRANCH
 #   SUSFS_REF / SUSFS_PATCH_FILE (susfs variants only)
+#   ENABLE_FTRACE=1 (optional; see the warning in kernel-helpers.sh)
 #
 set -euo pipefail
 
@@ -39,9 +40,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 IS_KPM_BUILD=0
 IS_SUSFS_BUILD=0
 IS_KSU_BUILD=0
+WANT_FTRACE=0
 if [[ "$KSU_TYPE" == *KPM* ]]; then IS_KPM_BUILD=1; fi
 if [[ "$KSU_TYPE" == *susfs* ]]; then IS_SUSFS_BUILD=1; fi
 if [[ "$KSU_TYPE" != "None" ]]; then IS_KSU_BUILD=1; fi
+if [[ "${ENABLE_FTRACE:-0}" == "1" ]]; then WANT_FTRACE=1; fi
 
 # ---- Toolchain / ccache env --------------------------------------------------
 CLANG_ROOT="${GITHUB_WORKSPACE}/toolchains/${CLANG_VERSION}/bin"
@@ -93,9 +96,10 @@ apply_variant_configs arch/arm64/configs/gki_defconfig
 # shellcheck disable=SC2086
 make O=out gki_defconfig ${ACTIVE_BUILD_CONFIGS}
 
-# NOTE: the vendor fragments above are merged AFTER gki_defconfig and can
-# override our settings (ingres' debugfs.config sets CONFIG_DEBUG_FS=n, for
-# example). So apply the variant configs again here, on the merged .config.
+# NOTE: vendor fragments are merged AFTER gki_defconfig and represent the
+# vendor's production choices (ingres' debugfs.config disables DEBUG_FS,
+# PAGE_OWNER and PAGE_PINNER on purpose). Re-applying our own settings here
+# overrides them, so only touch what the requested features actually need.
 apply_variant_configs out/.config
 
 if [[ "$IS_KPM_BUILD" -eq 1 ]]; then
@@ -159,12 +163,16 @@ assert_config_not_y() {
   fi
 }
 
-assert_config_y CONFIG_FTRACE           "ftrace menu switch; the other tracers depend on it"
-assert_config_y CONFIG_FUNCTION_TRACER  "ftrace debugging was requested for all builds"
-assert_config_y CONFIG_DYNAMIC_FTRACE   "ftrace debugging was requested for all builds"
-assert_config_y CONFIG_DEBUG_FS         "ftrace needs debugfs to expose its interface"
-assert_config_y CONFIG_FTRACE_SYSCALLS  "ftrace debugging was requested for all builds"
-assert_config_y CONFIG_STACK_TRACER     "ftrace debugging was requested for all builds"
+if [[ "$WANT_FTRACE" -eq 1 ]]; then
+  assert_config_y CONFIG_FTRACE           "ftrace menu switch; the other tracers depend on it"
+  assert_config_y CONFIG_FUNCTION_TRACER  "ENABLE_FTRACE=1 was requested"
+  assert_config_y CONFIG_DYNAMIC_FTRACE   "ENABLE_FTRACE=1 was requested"
+  assert_config_y CONFIG_DEBUG_FS         "ftrace needs debugfs to expose its interface"
+  assert_config_y CONFIG_FTRACE_SYSCALLS  "ENABLE_FTRACE=1 was requested"
+  assert_config_y CONFIG_STACK_TRACER     "ENABLE_FTRACE=1 was requested"
+else
+  echo "  [i]    ftrace not requested (ENABLE_FTRACE unset); vendor config kept as-is"
+fi
 
 if [[ "$IS_KSU_BUILD" -eq 1 ]]; then
   assert_config_y CONFIG_KSU "root support was requested"
@@ -187,14 +195,12 @@ if [[ "$PREFLIGHT_FAILED" -ne 0 ]]; then
   grep -E '^(# )?CONFIG_(KSU|KPM|KALLSYMS|TRACING|FTRACE|FUNCTION_TRACER|DYNAMIC_FTRACE|DEBUG_FS|STACK_TRACER)' out/.config || true
   exit 1
 fi
-echo "[+] Preflight passed: all requested features are enabled in out/.config."
+echo "[+] Preflight passed."
 
-# NOTE: there is deliberately no "compile only drivers/kernelsu/" fast check
-# here. `make <subdir>/` cannot build the KSU driver on its own: ksu.c includes
-# <generated/compile.h>, which scripts/mkcompile_h only writes while building
-# init/, so the shortcut always fails with a missing-header error that says
-# nothing about the code. An optimisation that reports false failures costs
-# more than the minutes it saves.
+# Record how the tracing options ended up, so a non-booting build can be
+# correlated with them afterwards.
+echo "==== TRACING / DEBUGFS CONFIG AS BUILT ===="
+grep -E '^(# )?CONFIG_(TRACING|FTRACE|FUNCTION_TRACER|DYNAMIC_FTRACE|DEBUG_FS|STACK_TRACER|PAGE_OWNER|PAGE_PINNER)[ =]' out/.config || true
 
 # ---- Build -------------------------------------------------------------------
 ccache -z || true
@@ -215,8 +221,7 @@ test -f out/arch/arm64/boot/Image || {
 echo "[+] Kernel Image built successfully: out/arch/arm64/boot/Image"
 
 # =============================================================================
-# SYMBOL ASSERTIONS -- a successful compile only proves the compiler was happy.
-# Patterns are deliberately broad; the config assertions above pin specifics.
+# SYMBOL ASSERTIONS
 # =============================================================================
 if [[ -f out/vmlinux ]]; then
   echo "==== SYMBOL ASSERTIONS ===="
@@ -245,10 +250,9 @@ if [[ -f out/vmlinux ]]; then
   if [[ "$IS_KPM_BUILD" -eq 1 ]]; then
     assert_symbol '[ _]kpm|[ _]KPM' "the KPM objects did not get linked in"
   fi
-  assert_symbol ' ftrace_' "ftrace did not get compiled in"
-
-  echo "---- KPM symbols found ----"
-  grep -iE 'kpm' vmlinux-symbols.txt | head -n 20 || true
+  if [[ "$WANT_FTRACE" -eq 1 ]]; then
+    assert_symbol ' ftrace_' "ftrace did not get compiled in"
+  fi
 
   if [[ "$SYMBOLS_FAILED" -ne 0 ]]; then
     echo "::error::A requested feature compiled but is not present in vmlinux."
@@ -260,9 +264,7 @@ else
 fi
 
 # =============================================================================
-# KPM Image patching. Compiling kpm/*.o is only half of KPM: the KernelPatch
-# loader has to be embedded into the Image by patch_linux, otherwise the manager
-# reports "KernelPatch was not found".
+# KPM Image patching.
 # =============================================================================
 if [[ "$IS_KPM_BUILD" -eq 1 ]]; then
   echo "[+] Patching Image with the KPM loader..."
@@ -303,13 +305,10 @@ if [[ "$IS_KPM_BUILD" -eq 1 ]]; then
     exit 1
   fi
 
-  # arm64 Image header magic 'ARM\x64' lives at byte offset 56. If patch_linux
-  # corrupts it the device will not boot, so fail rather than ship a brick.
   HEADER_MAGIC="$(dd if=oImage bs=1 skip=56 count=4 status=none | xxd -p | tr -d '\n' || true)"
   if [[ "$HEADER_MAGIC" != "41524d64" ]]; then
     echo "::error::oImage arm64 header magic is '${HEADER_MAGIC}', expected 41524d64."
     echo "::error::patch_linux corrupted the image header; this build would not boot."
-    echo "::error::The unpatched image is kept at Image.unpatched."
     popd >/dev/null
     exit 1
   fi
@@ -324,7 +323,6 @@ echo "==== FINAL CONFIG SNAPSHOT ===="
 grep -E '^CONFIG_(KSU|KPM|KALLSYMS|FTRACE|FUNCTION_TRACER|DYNAMIC_FTRACE|DEBUG_FS|STACK_TRACER)' out/.config || true
 
 if [[ "$IS_SUSFS_BUILD" -eq 1 ]]; then
-  # Source-text verifiers drift between susfs releases, so they stay advisory.
   ( verify_resukisu_susfs_hook_mode ) \
     || echo "::warning::verify_resukisu_susfs_hook_mode reported an issue (advisory)."
   ( verify_susfs_binary_presence ) \
@@ -333,4 +331,4 @@ fi
 
 ccache -sv || true
 test -f out/arch/arm64/boot/Image
-echo "[+] All requested features verified: root / susfs / KPM / ftrace."
+echo "[+] Build complete."
