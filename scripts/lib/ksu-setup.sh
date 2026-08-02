@@ -5,6 +5,20 @@
 # ensure_line_in_file, detect_kernelsu_driver_dir, kernelsu_kconfig_source_path).
 #
 
+# ---------------------------------------------------------------------------
+# PINNED UPSTREAM REFS
+#
+# As of 2026-08 no single upstream branch provides root + susfs + KPM:
+#   ReSukiSU main        -> root + native susfs, KPM deliberately removed
+#   SukiSU-Ultra main    -> root + KPM, susfs removed in the 4.x rewrite
+#   SukiSU-Ultra v3.1.7  -> root + KPM + flat layout that susfs4ksu patches
+#
+# The susfs-main / susfs-dev / susfs-stable branches no longer exist, so the
+# KPM variant is pinned to the v3.1.7 tag. Bump this deliberately, never
+# implicitly.
+# ---------------------------------------------------------------------------
+SUKISU_KPM_REF="${SUKISU_KPM_REF:-v3.1.7}"
+
 setup_kernelsu_repo() {
   local owner="$1"
   local repo="$2"
@@ -34,17 +48,17 @@ setup_kernelsu_repo() {
     [[ -z "$ref" ]] && continue
 
     if git clone --depth=1 --no-tags -b "$ref" "https://github.com/${owner}/${repo}.git" "$repo_dir"; then
-      echo "[+] Cloned ${owner}/${repo} branch '$ref'."
+      echo "[+] Cloned ${owner}/${repo} at '$ref'."
       cloned=1
       break
     fi
 
     rm -rf "$repo_dir"
-    echo "[!] ${owner}/${repo} branch '$ref' is unavailable, trying next fallback..."
+    echo "[!] ${owner}/${repo} ref '$ref' is unavailable, trying next fallback..."
   done
 
   if [[ "$cloned" -ne 1 ]]; then
-    echo "::error::Failed to clone ${owner}/${repo} from https://github.com/${owner}/${repo}.git using refs: $refs_to_try"
+    echo "::error::Failed to clone ${owner}/${repo} using refs: $refs_to_try"
     exit 1
   fi
 
@@ -60,35 +74,54 @@ setup_kernelsu_next() {
   setup_kernelsu_repo "KernelSU-Next" "KernelSU-Next" "$requested_ref" 1
 }
 
-# Sanity check: the KPM variant is only meaningful if the KSU driver we just
-# installed actually contains the KPM sources and Kconfig entry. ReSukiSU does
-# not (KPM was removed upstream), SukiSU-Ultra's susfs-main branch does.
+# The KPM variant only works if the installed tree really is the pinned
+# SukiSU-Ultra release: KPM sources present, and the flat (pre-4.x) layout that
+# the susfs4ksu KernelSU patch expects. Upstream's setup.sh swallows a failed
+# checkout ("|| echo Checkout default branch") and silently leaves you on main,
+# which is exactly how a KPM-capable-but-susfs-less tree slipped through before.
 verify_kpm_capable_driver() {
-  local driver_dir ksu_kernel_dir
+  local driver_dir ksu_kernel_dir failed=0
   driver_dir="$(detect_kernelsu_driver_dir)" || {
     echo "::error::drivers directory not found while verifying KPM support"
     exit 1
   }
   ksu_kernel_dir="$(readlink -f "${driver_dir}/kernelsu")"
 
-  test -f "${ksu_kernel_dir}/kpm/kpm.c" || {
-    echo "::error::The installed KernelSU driver has no kpm/ sources at ${ksu_kernel_dir}/kpm."
-    echo "::error::KPM builds require a KSU tree that ships KPM (e.g. SukiSU-Ultra)."
-    exit 1
-  }
+  echo "==== KSU TREE VERIFICATION ===="
 
-  grep -q 'config KPM' "${ksu_kernel_dir}/Kconfig" || {
-    echo "::error::The installed KernelSU Kconfig has no 'config KPM' entry."
-    exit 1
-  }
+  if [[ -f "${ksu_kernel_dir}/kpm/kpm.c" ]]; then
+    echo "  [OK]   kpm/kpm.c present"
+  else
+    echo "  [FAIL] no kpm/ sources at ${ksu_kernel_dir}/kpm"
+    failed=1
+  fi
 
-  grep -q 'kpm/kpm.o' "${ksu_kernel_dir}/Kbuild" 2>/dev/null || \
-  grep -q 'kpm/kpm.o' "${ksu_kernel_dir}/Makefile" 2>/dev/null || {
-    echo "::error::The installed KernelSU build files do not reference kpm/kpm.o."
-    exit 1
-  }
+  if grep -q 'config KPM' "${ksu_kernel_dir}/Kconfig" 2>/dev/null; then
+    echo "  [OK]   Kconfig has 'config KPM'"
+  else
+    echo "  [FAIL] Kconfig has no 'config KPM' entry"
+    failed=1
+  fi
 
-  echo "[+] Verified: installed KSU driver ships KPM sources, Kconfig and build rules."
+  # Flat layout check: the susfs4ksu KernelSU patch targets core_hook.c at the
+  # top level. The 4.x tree moved this to core/init.c and the patch shreds it.
+  if [[ -f "${ksu_kernel_dir}/core_hook.c" ]]; then
+    echo "  [OK]   flat layout (core_hook.c) -- susfs4ksu patch will apply"
+  else
+    echo "  [FAIL] no core_hook.c -- this is a 4.x-style tree (core/init.c),"
+    echo "         the susfs4ksu KernelSU patch will not apply to it."
+    echo "         Most likely the pinned ref was not checked out."
+    failed=1
+  fi
+
+  if [[ "$failed" -ne 0 ]]; then
+    echo "::error::The installed KSU tree cannot satisfy susfs + KPM together."
+    echo "::error::Checked out tree contents:"
+    ls -1 "${ksu_kernel_dir}" | head -n 40
+    exit 1
+  fi
+
+  echo "[+] KSU tree verified: KPM sources + flat layout for susfs."
   export KSU_KERNEL_DIR="$ksu_kernel_dir"
 }
 
@@ -116,12 +149,12 @@ install_ksu_variant() {
         "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash -s main
       ;;
     "ReSukiSU-with-susfs-KPM")
-      # KPM requires SukiSU-Ultra. Its susfs-main branch has susfs support
-      # built in, so the susfs4ksu KernelSU-side patch must NOT be applied on
-      # top of it (that is what used to blow up core_hook.c / init.c).
-      echo "[+] KPM variant requested: using SukiSU-Ultra branch susfs-main."
-      curl --retry 5 --retry-delay 3 --retry-all-errors -fLSs \
-        "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s susfs-main
+      # Clone the pinned tag ourselves instead of piping upstream's setup.sh:
+      # setup.sh treats a failed checkout as a warning and continues on the
+      # default branch, which silently produces a tree without susfs support.
+      # setup_kernelsu_repo uses `git clone -b <ref>` and hard-fails instead.
+      echo "[+] KPM variant: pinning SukiSU-Ultra to ${SUKISU_KPM_REF}."
+      setup_kernelsu_repo "SukiSU-Ultra" "SukiSU-Ultra" "$SUKISU_KPM_REF" 0
       verify_kpm_capable_driver
       ;;
     *)
