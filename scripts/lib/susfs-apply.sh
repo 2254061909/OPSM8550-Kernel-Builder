@@ -38,6 +38,25 @@ patch_susfs_kernelsu_layout() {
   fi
 }
 
+# A rejected hunk only matters to us if it actually carries susfs content.
+# susfs4ksu's KernelSU patch is cut against whatever SukiSU tree the susfs
+# author happened to have, so it also drags along unrelated refactors of that
+# snapshot (e.g. flattening the ksu_late_loaded branch, dropping the LKM
+# kobject_del). Those hunks conflict with a newer tree and applying them would
+# actively remove upstream features.
+#
+# Rule: if none of a reject's added lines mention susfs, the hunk contributes no
+# susfs functionality and is safe to drop. If any added line mentions susfs, the
+# reject is real and the build must stop.
+susfs_reject_is_benign() {
+  local rej="$1"
+  # Added lines only ('+' but not the '+++' file header).
+  if grep -E '^\+' "$rej" | grep -v '^+++' | grep -qi 'susfs'; then
+    return 1
+  fi
+  return 0
+}
+
 patch_kernelsu_for_susfs() {
   local ksu_repo_dir="$1"
   local ksu_dir="$2"
@@ -68,43 +87,52 @@ patch_kernelsu_for_susfs() {
     patch -p1 --batch --forward < "$(basename "$patch_file")"
   ) || patch_rc=$?
 
-  # Always report what the patch actually did, success or not. Being blind to
-  # the rejects is what made the previous rounds so slow to diagnose.
-  local reject_files reject_count
-  reject_files="$(find "$ksu_repo_dir" -name '*.rej' | sort)"
-  reject_count="$(printf '%s\n' "$reject_files" | sed '/^$/d' | wc -l)"
+  local blocking=0
+  local rej
+  while IFS= read -r rej; do
+    [[ -z "$rej" ]] && continue
+    echo "---------- REJECT: ${rej} ----------"
+    cat "$rej"
+    echo
 
-  if [[ "$reject_count" -gt 0 ]]; then
-    echo "==== KERNELSU SUSFS PATCH REJECTS (${reject_count} file(s)) ===="
-    local rej
-    printf '%s\n' "$reject_files" | sed '/^$/d' | while IFS= read -r rej; do
-      echo "---------- ${rej} ----------"
-      cat "$rej"
-      echo
-      # Show the current state of the target file around the rejected area so
-      # the drift is obvious without needing a local checkout.
+    if susfs_reject_is_benign "$rej"; then
+      echo "[+] No susfs content in this reject -- it is an unrelated refactor"
+      echo "    from the susfs author's tree snapshot. Dropping it and keeping"
+      echo "    the upstream code as-is."
+      rm -f "$rej"
+    else
+      echo "::error::This reject adds susfs code and must be resolved:"
+      echo "::error::  ${rej}"
       local target="${rej%.rej}"
       if [[ -f "$target" ]]; then
         echo "---------- current ${target} (first 80 lines) ----------"
         head -n 80 "$target"
         echo
       fi
-    done
-  fi
+      blocking=1
+    fi
+  done < <(find "$ksu_repo_dir" -name '*.rej' | sort)
 
-  if [[ "$patch_rc" -ne 0 ]] || [[ "$reject_count" -gt 0 ]]; then
-    echo "::error::The susfs KernelSU patch did not apply cleanly (rc=${patch_rc}, rejects=${reject_count})."
+  if [[ "$blocking" -ne 0 ]]; then
+    echo "::error::The susfs KernelSU patch left unresolved susfs-bearing rejects."
     echo "::error::Patch: $patch_file"
     echo "::error::Tree:  $ksu_repo_dir"
     exit 1
   fi
 
+  # The real gate: regardless of hunk-level noise, susfs must actually be
+  # wired into the KernelSU Kconfig, or nothing downstream can enable it.
   grep -q 'KSU_SUSFS' "$kconfig_file" || {
-    echo "::error::KernelSU susfs patch reported success but KSU_SUSFS is still missing from $kconfig_file"
+    echo "::error::Patch finished but KSU_SUSFS is still missing from $kconfig_file"
+    echo "::error::susfs would silently be a no-op; refusing to continue."
     exit 1
   }
 
-  echo "[+] KernelSU susfs patch applied cleanly."
+  if [[ "$patch_rc" -ne 0 ]]; then
+    echo "[+] susfs KernelSU patch applied; only benign non-susfs hunks were rejected."
+  else
+    echo "[+] susfs KernelSU patch applied cleanly."
+  fi
 }
 
 patch_resukisu_susfs_runtime_compat() {
@@ -118,7 +146,7 @@ patch_resukisu_susfs_runtime_compat() {
      grep -Eq '^[[:space:]]*DEFINE_STATIC_KEY_TRUE\(ksu_is_input_hook_enabled\);$' "$runtime_file" && \
      grep -Eq '^[[:space:]]*#define ksu_init_rc_hook_inactive\(\) \(!static_branch_likely\(&ksu_is_init_rc_hook_enabled\)\)$' "$runtime_file" && \
      grep -Eq '^[[:space:]]*#define ksu_input_hook_inactive\(\) \(!static_branch_likely\(&ksu_is_input_hook_enabled\)\)$' "$runtime_file"; then
-    echo "[+] ReSukiSU runtime already contains native susfs hook support."
+    echo "[+] Runtime already contains native susfs hook support."
     return 0
   fi
 
