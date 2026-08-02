@@ -50,7 +50,7 @@ patch_kernelsu_for_susfs() {
   }
 
   if grep -q 'KSU_SUSFS' "$kconfig_file"; then
-    echo "[+] KernelSU tree already contains KSU_SUSFS entries."
+    echo "[+] KernelSU tree already contains KSU_SUSFS entries (native susfs support)."
     return 0
   fi
 
@@ -59,18 +59,52 @@ patch_kernelsu_for_susfs() {
     exit 1
   }
 
+  # --batch: never prompt for "File to patch:" -- an unattended runner has no
+  #          stdin, and the prompts turn a clean failure into a wall of noise.
+  # --forward: skip hunks that are already applied instead of asking.
+  local patch_rc=0
   (
     cd "$ksu_repo_dir"
-    patch -p1 < "$(basename "$patch_file")"
-  ) || {
-    echo "::error::Failed to apply KernelSU susfs patch in $ksu_repo_dir"
+    patch -p1 --batch --forward < "$(basename "$patch_file")"
+  ) || patch_rc=$?
+
+  # Always report what the patch actually did, success or not. Being blind to
+  # the rejects is what made the previous rounds so slow to diagnose.
+  local reject_files reject_count
+  reject_files="$(find "$ksu_repo_dir" -name '*.rej' | sort)"
+  reject_count="$(printf '%s\n' "$reject_files" | sed '/^$/d' | wc -l)"
+
+  if [[ "$reject_count" -gt 0 ]]; then
+    echo "==== KERNELSU SUSFS PATCH REJECTS (${reject_count} file(s)) ===="
+    local rej
+    printf '%s\n' "$reject_files" | sed '/^$/d' | while IFS= read -r rej; do
+      echo "---------- ${rej} ----------"
+      cat "$rej"
+      echo
+      # Show the current state of the target file around the rejected area so
+      # the drift is obvious without needing a local checkout.
+      local target="${rej%.rej}"
+      if [[ -f "$target" ]]; then
+        echo "---------- current ${target} (first 80 lines) ----------"
+        head -n 80 "$target"
+        echo
+      fi
+    done
+  fi
+
+  if [[ "$patch_rc" -ne 0 ]] || [[ "$reject_count" -gt 0 ]]; then
+    echo "::error::The susfs KernelSU patch did not apply cleanly (rc=${patch_rc}, rejects=${reject_count})."
+    echo "::error::Patch: $patch_file"
+    echo "::error::Tree:  $ksu_repo_dir"
+    exit 1
+  fi
+
+  grep -q 'KSU_SUSFS' "$kconfig_file" || {
+    echo "::error::KernelSU susfs patch reported success but KSU_SUSFS is still missing from $kconfig_file"
     exit 1
   }
 
-  grep -q 'KSU_SUSFS' "$kconfig_file" || {
-    echo "::error::KernelSU susfs patch applied but KSU_SUSFS is still missing from $kconfig_file"
-    exit 1
-  }
+  echo "[+] KernelSU susfs patch applied cleanly."
 }
 
 patch_resukisu_susfs_runtime_compat() {
@@ -181,6 +215,12 @@ apply_susfs_full() {
   git clone --depth=1 --no-tags -b "$susfs_ref" \
     https://gitlab.com/simonpunk/susfs4ksu.git susfs
 
+  # Record exactly which susfs revision we are building against.
+  echo "==== SUSFS SOURCE ===="
+  echo "branch: $susfs_ref"
+  ( cd susfs && git log -1 --format='commit: %H%ncommit date: %ci' ) || true
+  grep -E '^#define SUSFS_VERSION' ./susfs/kernel_patches/include/linux/susfs.h 2>/dev/null || true
+
   (
     cd susfs
     cp "./kernel_patches/${susfs_patch_file}" ..
@@ -207,7 +247,7 @@ apply_susfs_full() {
     exit 1
   }
 
-  if ! patch -p1 < "${susfs_patch_file}"; then
+  if ! patch -p1 --batch --forward < "${susfs_patch_file}"; then
     echo "[!] susfs patch reported conflicts, checking for known task_mmu.c drift..."
 
     local reject_files reject_count
