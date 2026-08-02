@@ -66,17 +66,18 @@ on:
           - ReSukiSU + susfs
           - ReSukiSU + susfs + KPM
           - ReSukiSU + susfs (build both: with KPM and without KPM)
-      enable_ftrace:
+      ftrace_level:
         description: >-
-          Enable ftrace/debug tracing. WARNING: changes core struct layouts and
-          overrides the vendor's DEBUG_FS=n. Stock vendor_dlkm modules may fail
-          to load and the device may not boot. Leave off unless you need it.
+          trace = function tracing at /sys/kernel/tracing, vendor DEBUG_FS kept
+          (default). full = also force CONFIG_DEBUG_FS=y, known NOT to boot on
+          ingres. none = leave the vendor tracing config untouched.
         required: true
         type: choice
-        default: "no"
+        default: trace
         options:
-          - "no"
-          - "yes"
+          - trace
+          - none
+          - full
 
 jobs:
   prepare:
@@ -106,7 +107,7 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.prepare.outputs.build_matrix) }}
     concurrency:
-      group: kernel-ci-${{ github.workflow }}-${{ github.ref_name }}-${{ inputs.platform }}-${{ inputs.source_choice }}-${{ inputs.branch_mode }}-${{ inputs.kernel_branch }}-${{ matrix.ksu_type }}-${{ inputs.clang_choice }}
+      group: kernel-ci-${{ github.workflow }}-${{ github.ref_name }}-${{ inputs.platform }}-${{ inputs.source_choice }}-${{ inputs.branch_mode }}-${{ inputs.kernel_branch }}-${{ matrix.ksu_type }}-${{ inputs.clang_choice }}-${{ inputs.ftrace_level }}
       cancel-in-progress: true
 
     permissions:
@@ -233,7 +234,7 @@ jobs:
 
       - name: Compile kernel
         env:
-          ENABLE_FTRACE: ${{ inputs.enable_ftrace == 'yes' && '1' || '0' }}
+          FTRACE_LEVEL: ${{ inputs.ftrace_level }}
         run: bash "${GITHUB_WORKSPACE}/scripts/compile-kernel.sh"
 
       - name: Make AnyKernel3 zip
