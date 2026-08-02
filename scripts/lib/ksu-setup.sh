@@ -25,12 +25,20 @@ setup_kernelsu_repo() {
   local repo="$2"
   local requested_ref="$3"
   local allow_fallbacks="${4:-0}"
+  # full_history=1 keeps the whole object store so `git apply -3` can do a real
+  # three-way merge against the blobs referenced by a patch's index lines.
+  local full_history="${5:-0}"
   local repo_dir="$repo"
   local driver_dir
   local kconfig_source
   local ref
   local cloned=0
   local refs_to_try
+  local depth_args="--depth=1 --no-tags"
+
+  if [[ "$full_history" == "1" ]]; then
+    depth_args=""
+  fi
 
   driver_dir="$(detect_kernelsu_driver_dir)" || {
     echo "::error::drivers directory not found in kernel tree"
@@ -48,7 +56,8 @@ setup_kernelsu_repo() {
   for ref in $refs_to_try; do
     [[ -z "$ref" ]] && continue
 
-    if git clone --depth=1 --no-tags -b "$ref" "https://github.com/${owner}/${repo}.git" "$repo_dir"; then
+    # shellcheck disable=SC2086
+    if git clone $depth_args -b "$ref" "https://github.com/${owner}/${repo}.git" "$repo_dir"; then
       echo "[+] Cloned ${owner}/${repo} at '$ref'."
       cloned=1
       break
@@ -80,12 +89,13 @@ setup_kernelsu_next() {
 # failed checkout ("|| echo Checkout default branch"), so we clone the ref
 # ourselves and verify the result rather than trusting it.
 verify_kpm_capable_driver() {
-  local driver_dir ksu_kernel_dir failed=0
+  local driver_dir ksu_kernel_dir ksu_repo_dir failed=0
   driver_dir="$(detect_kernelsu_driver_dir)" || {
     echo "::error::drivers directory not found while verifying KPM support"
     exit 1
   }
   ksu_kernel_dir="$(readlink -f "${driver_dir}/kernelsu")"
+  ksu_repo_dir="$(dirname "$ksu_kernel_dir")"
 
   echo "==== KSU TREE VERIFICATION ===="
 
@@ -113,6 +123,18 @@ verify_kpm_capable_driver() {
     echo "  [FAIL] not a modular tree; susfs4ksu's KernelSU patch will match nothing."
     echo "         Old flat trees (core_hook.c at top level) are NOT usable."
     failed=1
+  fi
+
+  # Full history is required for the three-way merge in patch_kernelsu_for_susfs.
+  if [[ -f "${ksu_repo_dir}/.git/shallow" ]]; then
+    echo "  [WARN] shallow clone; attempting to unshallow for three-way merge"
+    git -C "$ksu_repo_dir" fetch --unshallow --tags >/dev/null 2>&1 || \
+      echo "  [WARN] unshallow failed; three-way merge may be unavailable"
+  fi
+  if [[ -f "${ksu_repo_dir}/.git/shallow" ]]; then
+    echo "  [WARN] still shallow"
+  else
+    echo "  [OK]   full git history available for three-way merge"
   fi
 
   if [[ "$failed" -ne 0 ]]; then
@@ -153,8 +175,9 @@ install_ksu_variant() {
       # Clone ourselves instead of piping upstream's setup.sh: setup.sh treats a
       # failed checkout as a warning and silently continues on the default
       # branch, which is how a wrong tree slipped through before.
-      echo "[+] KPM variant: SukiSU-Ultra @ ${SUKISU_KPM_REF}."
-      setup_kernelsu_repo "SukiSU-Ultra" "SukiSU-Ultra" "$SUKISU_KPM_REF" 0
+      # Full history (5th arg) is needed for `git apply -3`.
+      echo "[+] KPM variant: SukiSU-Ultra @ ${SUKISU_KPM_REF} (full history)."
+      setup_kernelsu_repo "SukiSU-Ultra" "SukiSU-Ultra" "$SUKISU_KPM_REF" 0 1
       verify_kpm_capable_driver
       ;;
     *)
