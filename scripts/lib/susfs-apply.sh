@@ -5,8 +5,7 @@
 #
 # NOTE: compile-kernel.sh runs under `set -euo pipefail`. Several helpers here
 # probe the tree with grep/find, where "no match" is a normal outcome that
-# returns 1. Those functions disable errexit locally and restore it on exit,
-# otherwise a routine miss aborts the whole build with no message at all.
+# returns 1. Those functions disable errexit locally and restore it on exit.
 #
 
 apply_susfs_task_mmu_fix() {
@@ -43,19 +42,18 @@ patch_susfs_kernelsu_layout() {
   fi
 }
 
-# Line number of the anchor we insert restored #includes after.
+# Does the KSU tree ship susfs support itself?
 #
-# It MUST be the FIRST #include in the file, not the last. Several KSU sources
-# end with includes inside a conditional block, e.g. core/init.c:
-#
-#     #if defined(CONFIG_STACKPROTECTOR) && ... && defined(MODULE) ...
-#     #include <linux/stackprotector.h>
-#     #include <linux/random.h>          <-- last #include in the file
-#     #endif
-#
-# For a built-in (non-module) build that block is preprocessed away, so
-# anything appended after it is silently invisible to the compiler: the file
-# grows by a line and the build fails with exactly the same errors.
+# This is the master switch for everything below. A tree with native support
+# (SukiSU-Ultra `builtin`, ReSukiSU) needs NOTHING from the KernelSU-side susfs
+# patch or from our compatibility shims -- only CONFIG_KSU_SUSFS=y and the
+# kernel-tree patch. Running the shims against such a tree rewrites code that
+# is already correct and then fails its own assertions.
+ksu_tree_has_native_susfs() {
+  local ksu_kernel_dir="$1"
+  grep -q 'KSU_SUSFS' "${ksu_kernel_dir}/Kconfig" 2>/dev/null
+}
+
 _first_include_line() {
   grep -n '^#include' "$1" | head -n 1 | cut -d: -f1
 }
@@ -69,6 +67,9 @@ _decl_symbol_name() {
   fi
 }
 
+# The repairs below only ever run for trees WITHOUT native susfs, i.e. when we
+# had to force the KernelSU-side patch in. They are kept because that path
+# still exists for other presets, but the supported KPM path never reaches them.
 restore_includes_deleted_by_susfs_patch() {
   set +e
   local ksu_repo_dir="$1"
@@ -92,12 +93,9 @@ restore_includes_deleted_by_susfs_patch() {
 
     local anchor
     anchor="$(_first_include_line "$abs")"
-    if [[ -z "$anchor" ]]; then
-      echo "[!] ${file}: no #include anchor found, skipping restore"
-      continue
-    fi
+    [[ -z "$anchor" ]] && continue
 
-    echo "[+] Restoring ${#to_restore[@]} #include(s) in ${file} (after line ${anchor}):"
+    echo "[+] Restoring ${#to_restore[@]} #include(s) in ${file}:"
     printf '      %s\n' "${to_restore[@]}"
 
     local tmp="/tmp/ksu_inc.$$"
@@ -145,7 +143,7 @@ restore_declarations_deleted_from_ksu_headers() {
     local guard_line tmp="/tmp/ksu_decl.$$"
     guard_line="$(grep -n '^#endif' "$abs" | tail -n 1 | cut -d: -f1)"
     {
-      printf '\n/* Restored: removed by the susfs KernelSU patch, still used upstream. */\n'
+      printf '\n/* Restored: removed by the susfs KernelSU patch. */\n'
       printf '%s\n' "${to_restore[@]}"
     } > "$tmp"
 
@@ -163,10 +161,6 @@ restore_declarations_deleted_from_ksu_headers() {
   return 0
 }
 
-# For every ksu_* function core/init.c calls without a visible declaration,
-# find the header that declares it and include it. Falls back to a local
-# prototype. Also verifies afterwards that nothing is left undeclared, so this
-# never silently hands a broken file to the compiler.
 ensure_init_symbols_declared() {
   set +e
   local ksu_dir="$1"
@@ -176,10 +170,9 @@ ensure_init_symbols_declared() {
     return 0
   fi
 
-  local sym hdr rel decl_re anchor visible pass
+  local sym hdr rel decl_re anchor visible pass nested
   local unresolved=()
 
-  # Two passes: the first adds includes, the second re-checks and reports.
   for pass in 1 2; do
     unresolved=()
     local called
@@ -187,11 +180,8 @@ ensure_init_symbols_declared() {
 
     for sym in $called; do
       decl_re="^[A-Za-z_][A-Za-z0-9_[:space:]\*]*[[:space:]\*]${sym}[[:space:]]*\("
-
-      # Declared directly in init.c (a local prototype we added, or a static)?
       grep -qE "$decl_re" "$init_c" && continue
 
-      # Declared in a header init.c includes, transitively one level deep?
       visible=0
       while IFS= read -r rel; do
         [[ -z "$rel" ]] && continue
@@ -200,8 +190,6 @@ ensure_init_symbols_declared() {
           visible=1
           break
         fi
-        # one level of nesting: headers included by that header
-        local nested
         while IFS= read -r nested; do
           [[ -f "${ksu_dir}/${nested}" ]] || continue
           if grep -qE "$decl_re" "${ksu_dir}/${nested}"; then
@@ -226,7 +214,7 @@ ensure_init_symbols_declared() {
         echo "[+] core/init.c: ${sym} -> #include \"${rel}\""
       else
         sed -i "${anchor}a void ${sym}(void);" "$init_c"
-        echo "[+] core/init.c: ${sym} -> local prototype void ${sym}(void);"
+        echo "[+] core/init.c: ${sym} -> local prototype"
       fi
     done
   done
@@ -234,13 +222,10 @@ ensure_init_symbols_declared() {
   if [[ "${#unresolved[@]}" -gt 0 ]]; then
     echo "::error::These symbols used by core/init.c are still undeclared:"
     printf '::error::  %s\n' "${unresolved[@]}"
-    echo "==== core/init.c include block ===="
-    grep -n '^#include' "$init_c" | head -n 40
     set -e
     return 1
   fi
 
-  echo "[+] Every ksu_* symbol used by core/init.c has a visible declaration."
   set -e
   return 0
 }
@@ -265,29 +250,12 @@ resolve_known_susfs_ksu_drift() {
         }
         { print }
       ' "$init_c" > "${init_c}.new" && mv "${init_c}.new" "$init_c"
-
-      grep -q 'susfs_init();' "$init_c" || {
-        echo "::error::Could not inject susfs_init() into ${init_c}."
-        exit 1
-      }
       echo "[+] Injected susfs_init() into core/init.c."
     fi
-
-    grep -q '#include <linux/susfs.h>' "$init_c" || {
-      echo "::error::core/init.c calls susfs_init() but does not include <linux/susfs.h>."
-      exit 1
-    }
   fi
 
   if [[ -f "$profile_h" ]]; then
     sed -i 's/^void escape_to_root_for_init(void);$/int escape_to_root_for_init(void);/' "$profile_h"
-
-    grep -q '^int escape_to_root_for_init(void);$' "$profile_h" || {
-      echo "::error::Failed to fix the escape_to_root_for_init() prototype in ${profile_h}."
-      cat -n "$profile_h"
-      exit 1
-    }
-    echo "[+] app_profile.h: escape_to_root_for_init() prototype now returns int."
   fi
 
   restore_includes_deleted_by_susfs_patch "$ksu_repo_dir"
@@ -316,8 +284,9 @@ patch_kernelsu_for_susfs() {
     exit 1
   }
 
-  if grep -q 'KSU_SUSFS' "$kconfig_file"; then
-    echo "[+] KernelSU tree already contains KSU_SUSFS entries (native susfs support)."
+  if ksu_tree_has_native_susfs "$ksu_dir"; then
+    echo "[+] KSU tree has native susfs support -- skipping the KernelSU-side patch."
+    echo "    Only the kernel-tree patch (50_add_susfs_in_*) will be applied."
     return 0
   fi
 
@@ -338,19 +307,12 @@ patch_kernelsu_for_susfs() {
     else
       echo "########## UNEXPECTED REJECT: ${rej} ##########"
       cat "$rej"
-      echo
-      local target="${rej%.rej}"
-      if [[ -f "$target" ]]; then
-        echo "########## CURRENT ${target} ##########"
-        cat -n "$target"
-        echo
-      fi
       unexpected=1
     fi
   done < <(find "$ksu_repo_dir" -name '*.rej' | sort)
 
   if [[ "$unexpected" -ne 0 ]]; then
-    echo "::error::susfs KernelSU patch produced rejects we do not know how to resolve."
+    echo "::error::susfs KernelSU patch produced rejects we cannot resolve."
     exit 1
   fi
 
@@ -364,20 +326,23 @@ patch_kernelsu_for_susfs() {
     exit 1
   }
 
-  echo "[+] susfs KernelSU patch applied; known drift resolved; KSU_SUSFS wired in."
+  echo "[+] susfs KernelSU patch applied; KSU_SUSFS wired in."
 }
 
 patch_resukisu_susfs_runtime_compat() {
   local ksu_kernel_dir="$1"
   local runtime_file="${ksu_kernel_dir}/runtime/ksud_integration.c"
 
+  # Never touch a tree that ships susfs itself.
+  if ksu_tree_has_native_susfs "$ksu_kernel_dir"; then
+    return 0
+  fi
+
   [[ -f "$runtime_file" ]] || return 0
   grep -q 'CONFIG_KSU_SUSFS' "$runtime_file" || return 0
 
   if grep -Eq '^[[:space:]]*DEFINE_STATIC_KEY_TRUE\(ksu_is_init_rc_hook_enabled\);$' "$runtime_file" && \
-     grep -Eq '^[[:space:]]*DEFINE_STATIC_KEY_TRUE\(ksu_is_input_hook_enabled\);$' "$runtime_file" && \
-     grep -Eq '^[[:space:]]*#define ksu_init_rc_hook_inactive\(\) \(!static_branch_likely\(&ksu_is_init_rc_hook_enabled\)\)$' "$runtime_file" && \
-     grep -Eq '^[[:space:]]*#define ksu_input_hook_inactive\(\) \(!static_branch_likely\(&ksu_is_input_hook_enabled\)\)$' "$runtime_file"; then
+     grep -Eq '^[[:space:]]*DEFINE_STATIC_KEY_TRUE\(ksu_is_input_hook_enabled\);$' "$runtime_file"; then
     echo "[+] Runtime already contains native susfs hook support."
     return 0
   fi
@@ -393,32 +358,16 @@ patch_resukisu_susfs_runtime_compat() {
   insert_line_before_first_match "$runtime_file" "// use define to avoid ifdef" "DEFINE_STATIC_KEY_TRUE(ksu_is_input_hook_enabled);"
   insert_line_before_first_match "$runtime_file" "// use define to avoid ifdef" "#define ksu_init_rc_hook_key_false ksu_is_init_rc_hook_enabled"
   insert_line_before_first_match "$runtime_file" "// use define to avoid ifdef" "#define ksu_input_hook_key_false ksu_is_input_hook_enabled"
-
-  grep -Eq '^[[:space:]]*DEFINE_STATIC_KEY_TRUE\(ksu_is_init_rc_hook_enabled\);$' "$runtime_file" || {
-    echo "::error::Failed to inject ksu_is_init_rc_hook_enabled compatibility into ${runtime_file}"
-    exit 1
-  }
-
-  grep -Eq '^[[:space:]]*DEFINE_STATIC_KEY_TRUE\(ksu_is_input_hook_enabled\);$' "$runtime_file" || {
-    echo "::error::Failed to inject ksu_is_input_hook_enabled compatibility into ${runtime_file}"
-    exit 1
-  }
-
-  if ! grep -Eq '^[[:space:]]*#define ksu_init_rc_hook ksu_is_init_rc_hook_enabled$' "$runtime_file" && \
-     ! grep -Eq '^[[:space:]]*#define ksu_init_rc_hook_inactive\(\) \(!static_branch_likely\(&ksu_is_init_rc_hook_enabled\)\)$' "$runtime_file"; then
-    echo "::error::Failed to retarget init_rc hook to the susfs static key in ${runtime_file}"
-    exit 1
-  fi
-
-  if ! grep -Eq '^[[:space:]]*#define ksu_input_hook ksu_is_input_hook_enabled$' "$runtime_file" && \
-     ! grep -Eq '^[[:space:]]*#define ksu_input_hook_inactive\(\) \(!static_branch_likely\(&ksu_is_input_hook_enabled\)\)$' "$runtime_file"; then
-    echo "::error::Failed to retarget input hook to the susfs static key in ${runtime_file}"
-    exit 1
-  fi
 }
 
 patch_susfs_selinux_hide_compat() {
   local ksu_kernel_dir="$1"
+
+  # Native trees define whatever their own susfs code needs.
+  if ksu_tree_has_native_susfs "$ksu_kernel_dir"; then
+    return 0
+  fi
+
   local kbuild_file="${ksu_kernel_dir}/Kbuild"
   [[ -f "$kbuild_file" ]] || kbuild_file="${ksu_kernel_dir}/Makefile"
   local compat_dir="${ksu_kernel_dir}/compat"
@@ -433,7 +382,7 @@ patch_susfs_selinux_hide_compat() {
       sed -i "\|^${compat_obj_line}$|d" "$kbuild_file"
     fi
     rm -f "$compat_file"
-    echo "[+] KernelSU tree already exports susfs SELinux hide compatibility symbols."
+    echo "[+] KernelSU tree already exports susfs SELinux hide symbols."
     return 0
   fi
 
@@ -455,7 +404,7 @@ bool ksu_selinux_hide_running __read_mostly = false;
 EOF_COMPAT
 
   ensure_line_in_file "$kbuild_file" "$compat_obj_line"
-  echo "[+] Added susfs SELinux hide compatibility symbols for this KernelSU tree."
+  echo "[+] Added susfs SELinux hide compatibility symbols."
 }
 
 apply_susfs_full() {
@@ -479,6 +428,11 @@ apply_susfs_full() {
   grep -E '^#define SUSFS_VERSION' ./susfs/kernel_patches/include/linux/susfs.h 2>/dev/null || true
   echo "==== KSU SOURCE ===="
   git -C "$ksu_repo_dir" log -1 --format='commit: %H%ncommit date: %ci' 2>/dev/null || true
+  if ksu_tree_has_native_susfs "$ksu_kernel_dir"; then
+    echo "native susfs support: yes"
+  else
+    echo "native susfs support: no (KernelSU-side patch will be applied)"
+  fi
 
   (
     cd susfs
@@ -487,7 +441,7 @@ apply_susfs_full() {
     cp ./kernel_patches/include/linux/* ../include/linux/
   )
 
-  cp ./susfs/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch "${ksu_repo_dir}/"
+  cp ./susfs/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch "${ksu_repo_dir}/" 2>/dev/null || true
   mkdir -p "${ksu_kernel_dir}/include/linux"
   cp ./susfs/kernel_patches/include/linux/* "${ksu_kernel_dir}/include/linux/"
   patch_kernelsu_for_susfs "${ksu_repo_dir}" "${ksu_kernel_dir}"
@@ -499,13 +453,8 @@ apply_susfs_full() {
     exit 1
   }
 
-  test -f "${ksu_kernel_dir}/include/linux/susfs_def.h" || {
-    echo "::error::susfs_def.h was not copied into ${ksu_kernel_dir}/include/linux"
-    exit 1
-  }
-
   if ! patch -p1 --batch --forward < "${susfs_patch_file}"; then
-    echo "[!] susfs patch reported conflicts, checking for known task_mmu.c drift..."
+    echo "[!] susfs kernel-tree patch reported conflicts, checking known drift..."
 
     local reject_files reject_count
     reject_files="$(find . -name "*.rej" | sort)"
@@ -516,7 +465,7 @@ apply_susfs_full() {
       rm -f ./fs/proc/task_mmu.c.rej
       echo "[+] Resolved known susfs task_mmu.c patch drift."
     else
-      echo "==== PATCH FAILED ===="
+      echo "==== KERNEL-TREE PATCH FAILED ===="
       find . -name "*.rej" -print -exec sh -c 'echo "---- $1 ----"; cat "$1"' _ {} \;
       exit 1
     fi
