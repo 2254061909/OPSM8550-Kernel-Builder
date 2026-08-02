@@ -39,20 +39,80 @@ patch_susfs_kernelsu_layout() {
 }
 
 # ---------------------------------------------------------------------------
-# The susfs KernelSU patch is cut against an older SukiSU snapshot. Its header
-# hunks apply "cleanly" while silently DELETING declarations that only exist in
-# the newer upstream tree -- e.g. `extern bool ksu_late_loaded;`, the
-# ksu_syscall_hook_manager_* API and ksu_lsm_hook_init(). core/init.c still
-# calls those, so the driver fails with a wall of implicit-declaration errors.
+# The susfs KernelSU patch is cut against an older SukiSU snapshot. Its hunks
+# apply "cleanly" while deleting things that only exist in the newer upstream
+# tree. Two distinct kinds of damage:
 #
-# General rule: susfs only ever needs to ADD things. Anything its header hunks
-# delete is an artifact of its stale base tree, so restoring those declarations
-# is always safe -- duplicate declarations are legal C, and a declaration for an
-# unused symbol is harmless.
+#   1. Deleted #include lines. core/init.c lost "hook/lsm_hook.h" and the
+#      syscall-hook-manager header, so ksu_lsm_hook_init() and
+#      ksu_syscall_hook_manager_*() became implicit declarations.
+#
+#   2. Deleted declarations in headers, e.g. `extern bool ksu_late_loaded;`
+#      from include/ksu.h.
+#
+# Both are restored below. The restore must be keyed on the SYMBOL NAME, not
+# the exact line: the patch legitimately CHANGES some signatures (it makes
+# escape_to_root_for_init() return int, and reshapes
+# ksu_adb_root_handle_execve()). Restoring those by exact-line comparison
+# reintroduces the old prototype next to the new one and yields
+# "conflicting types" errors.
 # ---------------------------------------------------------------------------
+
+# Symbol name from a declaration line: identifier just before '(' for
+# functions, or the last identifier for `extern <type> name;`.
+_decl_symbol_name() {
+  local line="$1"
+  if [[ "$line" == *"("* ]]; then
+    printf '%s' "$line" | sed -E 's/[[:space:]]*\(.*//' | grep -oE '[A-Za-z_][A-Za-z0-9_]*$'
+  else
+    printf '%s' "$line" | sed -E 's/[[:space:]]*;[[:space:]]*$//' | grep -oE '[A-Za-z_][A-Za-z0-9_]*$'
+  fi
+}
+
+restore_includes_deleted_by_susfs_patch() {
+  local ksu_repo_dir="$1"
+  local file line restored=0
+
+  while IFS= read -r file; do
+    [[ -z "$file" ]] && continue
+    local abs="${ksu_repo_dir}/${file}"
+    [[ -f "$abs" ]] || continue
+
+    local to_restore=()
+    while IFS= read -r line; do
+      [[ "$line" =~ ^#include ]] || continue
+      [[ "$line" == *susfs* ]] && continue
+      grep -Fxq "$line" "$abs" && continue
+      to_restore+=("$line")
+    done < <(git -C "$ksu_repo_dir" diff -U0 -- "$file" \
+               | grep '^-' | grep -v '^---' | sed 's/^-//')
+
+    [[ "${#to_restore[@]}" -eq 0 ]] && continue
+
+    echo "[+] Restoring ${#to_restore[@]} #include(s) removed from ${file}:"
+    printf '      %s\n' "${to_restore[@]}"
+
+    # Insert after the last existing #include so ordering stays sane.
+    local last_inc
+    last_inc="$(grep -n '^#include' "$abs" | tail -n 1 | cut -d: -f1)"
+    if [[ -n "$last_inc" ]]; then
+      local tmp="/tmp/ksu_inc.$$"
+      printf '%s\n' "${to_restore[@]}" > "$tmp"
+      sed -i "${last_inc}r ${tmp}" "$abs"
+      rm -f "$tmp"
+    else
+      printf '%s\n' "${to_restore[@]}" | cat - "$abs" > "${abs}.new" && mv "${abs}.new" "$abs"
+    fi
+    restored=1
+  done < <(git -C "$ksu_repo_dir" diff --name-only -- '*.c' '*.h')
+
+  [[ "$restored" -eq 0 ]] && echo "[i] No #include lines were removed by the patch."
+  return 0
+}
+
 restore_declarations_deleted_from_ksu_headers() {
   local ksu_repo_dir="$1"
-  local header deleted line restored_any=0
+  local header line restored=0
 
   while IFS= read -r header; do
     [[ -z "$header" ]] && continue
@@ -61,13 +121,17 @@ restore_declarations_deleted_from_ksu_headers() {
 
     local to_restore=()
     while IFS= read -r line; do
-      # Only declaration-shaped lines: `extern ...;` or `type name(...);`
       [[ "$line" =~ ^extern[[:space:]].*\;$ ]] || \
       [[ "$line" =~ ^[A-Za-z_][A-Za-z0-9_[:space:]\*]*\(.*\)\;$ ]] || continue
-      # Never resurrect something susfs deliberately reshaped.
       [[ "$line" == *susfs* ]] && continue
-      # Skip if the declaration is still present after patching.
-      grep -Fxq "$line" "$abs" && continue
+
+      local sym
+      sym="$(_decl_symbol_name "$line")"
+      [[ -z "$sym" ]] && continue
+      # If the symbol is declared at all after patching -- even with a
+      # different signature -- the patch reshaped it on purpose. Leave it.
+      grep -qE "\b${sym}\b" "$abs" && continue
+
       to_restore+=("$line")
     done < <(git -C "$ksu_repo_dir" diff -U0 -- "$header" \
                | grep '^-' | grep -v '^---' | sed 's/^-//')
@@ -77,27 +141,24 @@ restore_declarations_deleted_from_ksu_headers() {
     echo "[+] Restoring ${#to_restore[@]} declaration(s) removed from ${header}:"
     printf '      %s\n' "${to_restore[@]}"
 
-    # Insert before the final #endif of the include guard, or append.
-    local guard_line
+    local guard_line tmp="/tmp/ksu_decl.$$"
     guard_line="$(grep -n '^#endif' "$abs" | tail -n 1 | cut -d: -f1)"
-
     {
       printf '\n/* Restored: removed by the susfs KernelSU patch, still used upstream. */\n'
       printf '%s\n' "${to_restore[@]}"
-    } > /tmp/ksu_restore_block.$$
+    } > "$tmp"
 
     if [[ -n "$guard_line" ]]; then
-      sed -i "$((guard_line - 1))r /tmp/ksu_restore_block.$$" "$abs"
+      sed -i "$((guard_line - 1))r ${tmp}" "$abs"
     else
-      cat /tmp/ksu_restore_block.$$ >> "$abs"
+      cat "$tmp" >> "$abs"
     fi
-    rm -f /tmp/ksu_restore_block.$$
-    restored_any=1
+    rm -f "$tmp"
+    restored=1
   done < <(git -C "$ksu_repo_dir" diff --name-only -- '*.h')
 
-  if [[ "$restored_any" -eq 0 ]]; then
-    echo "[i] No declarations were removed from KSU headers by the patch."
-  fi
+  [[ "$restored" -eq 0 ]] && echo "[i] No declarations were removed from KSU headers."
+  return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -162,19 +223,24 @@ resolve_known_susfs_ksu_drift() {
       cat -n "$profile_h"
       exit 1
     fi
-
-    local profile_c="${ksu_dir}/policy/app_profile.c"
-    if [[ -f "$profile_c" ]] && grep -q 'escape_to_root_for_init' "$profile_c"; then
-      if grep -qE '^[[:space:]]*void[[:space:]]+escape_to_root_for_init\(void\)' "$profile_c"; then
-        echo "::error::app_profile.c still defines escape_to_root_for_init() as void"
-        echo "::error::while the header now declares int. Prototype mismatch."
-        exit 1
-      fi
-    fi
   fi
 
-  # --- 3. put back declarations the patch's header hunks removed ------------
+  # --- 3. put back what the patch's hunks silently removed ------------------
+  restore_includes_deleted_by_susfs_patch "$ksu_repo_dir"
   restore_declarations_deleted_from_ksu_headers "$ksu_repo_dir"
+
+  # --- 4. guard against duplicate prototypes we may have reintroduced -------
+  local dup_sym
+  for dup_sym in escape_to_root_for_init ksu_adb_root_handle_execve; do
+    local count
+    count="$(grep -rhcE "^[A-Za-z_].*\b${dup_sym}\b\(" "$ksu_dir" --include='*.h' 2>/dev/null | paste -sd+ | bc 2>/dev/null || echo 0)"
+    if [[ "${count:-0}" -gt 1 ]]; then
+      echo "::error::${dup_sym} is declared ${count} times across KSU headers;"
+      echo "::error::that will fail with 'conflicting types'."
+      grep -rnE "^[A-Za-z_].*\b${dup_sym}\b\(" "$ksu_dir" --include='*.h' || true
+      exit 1
+    fi
+  done
 }
 
 # Reject files we knowingly resolve above. Anything else is a real conflict.
@@ -209,10 +275,6 @@ patch_kernelsu_for_susfs() {
     exit 1
   }
 
-  # `git apply --reject` applies every hunk that fits and writes the rest to
-  # .rej, with no fuzzy context matching and no partial rewrites. A three-way
-  # merge is impossible here: the patch's base blobs live in the susfs author's
-  # fork, so --3way always reports "lacks the necessary blob".
   echo "==== Applying susfs KernelSU patch (git apply --reject) ===="
   git -C "$ksu_repo_dir" apply --reject --whitespace=nowarn "$patch_name" 2>&1 || true
 
@@ -346,8 +408,6 @@ EOF_COMPAT
   echo "[+] Added susfs SELinux hide compatibility symbols for this KernelSU tree."
 }
 
-# Full susfs apply flow: clone susfs, copy patches, patch KernelSU tree,
-# apply the kernel-side patch with drift recovery.
 apply_susfs_full() {
   local susfs_ref="$1"
   local susfs_patch_file="$2"
