@@ -38,14 +38,106 @@ patch_susfs_kernelsu_layout() {
   fi
 }
 
-# Restore tracked files to pristine HEAD. Deliberately does NOT `git clean`:
-# the patch file itself and the susfs headers we copy in are untracked, and
-# wiping them destroys the inputs for the next step.
-reset_ksu_tracked_files() {
-  local ksu_repo_dir="$1"
-  git -C "$ksu_repo_dir" checkout -- . 2>/dev/null || true
-  find "$ksu_repo_dir" -name '*.rej' -delete 2>/dev/null || true
-  find "$ksu_repo_dir" -name '*.orig' -delete 2>/dev/null || true
+# ---------------------------------------------------------------------------
+# Known drift between susfs4ksu's KernelSU patch and SukiSU-Ultra main.
+#
+# The patch is cut against an older SukiSU snapshot, so besides the susfs
+# changes it also carries that snapshot's own refactors. Three hunks reject:
+#
+#   kernel/Kbuild        hunk#2  deletes the x86 syscall-dispatcher block.
+#                                No susfs content. Applying it would break
+#                                x86 builds. -> intentionally skipped.
+#
+#   kernel/core/init.c   hunk#3  swaps hook/syscall_hook.h + infra/
+#                                symbol_resolver.h for the older
+#                                hook/setuid_hook.h + feature/sucompat.h.
+#                                No susfs content, and the old entry points
+#                                do not exist here. -> intentionally skipped.
+#
+#   kernel/core/init.c   hunk#7  rewrites the whole init sequence for the
+#                                pre-late-load architecture. The ONLY susfs
+#                                content in it is the susfs_init() call, so
+#                                we inject exactly that and leave the
+#                                surrounding upstream logic intact.
+#
+#   kernel/policy/       hunk#1  changes escape_to_root_for_init() from void
+#     app_profile.h              to int. This one is REQUIRED: app_profile.c
+#                                already patched cleanly and now returns int,
+#                                so the prototype must match or the driver
+#                                will not compile.
+#
+# Each fix is verified after the fact; anything unexpected fails the build.
+# ---------------------------------------------------------------------------
+resolve_known_susfs_ksu_drift() {
+  local ksu_dir="$1"
+  local init_c="${ksu_dir}/core/init.c"
+  local profile_h="${ksu_dir}/policy/app_profile.h"
+
+  # --- 1. init.c: inject susfs_init() ---------------------------------------
+  if [[ -f "$init_c" ]]; then
+    if grep -q 'susfs_init();' "$init_c"; then
+      echo "[+] init.c already calls susfs_init()."
+    else
+      # Insert immediately before the first ksu_supercalls_init() call, which
+      # is where the patch places it relative to the surrounding init order.
+      awk '
+        !done && /^[[:space:]]*ksu_supercalls_init\(\);[[:space:]]*$/ {
+          print "#ifdef CONFIG_KSU_SUSFS"
+          print "    susfs_init();"
+          print "#endif // CONFIG_KSU_SUSFS"
+          print ""
+          done = 1
+        }
+        { print }
+      ' "$init_c" > "${init_c}.new" && mv "${init_c}.new" "$init_c"
+
+      grep -q 'susfs_init();' "$init_c" || {
+        echo "::error::Could not inject susfs_init() into ${init_c}."
+        echo "::error::No 'ksu_supercalls_init();' anchor was found."
+        grep -n 'ksu_supercalls_init\|kernelsu_init' "$init_c" | head -n 20
+        exit 1
+      }
+      echo "[+] Injected susfs_init() into core/init.c."
+    fi
+
+    grep -q '#include <linux/susfs.h>' "$init_c" || {
+      echo "::error::core/init.c calls susfs_init() but does not include <linux/susfs.h>."
+      exit 1
+    }
+  fi
+
+  # --- 2. app_profile.h: prototype must match the patched .c ----------------
+  if [[ -f "$profile_h" ]]; then
+    sed -i 's/^void escape_to_root_for_init(void);$/int escape_to_root_for_init(void);/' "$profile_h"
+
+    if grep -q '^int escape_to_root_for_init(void);$' "$profile_h"; then
+      echo "[+] app_profile.h: escape_to_root_for_init() prototype now returns int."
+    else
+      echo "::error::Failed to fix the escape_to_root_for_init() prototype in ${profile_h}."
+      cat -n "$profile_h"
+      exit 1
+    fi
+
+    # Cross-check against the definition that the patch already updated.
+    local profile_c="${ksu_dir}/policy/app_profile.c"
+    if [[ -f "$profile_c" ]] && grep -q 'escape_to_root_for_init' "$profile_c"; then
+      if grep -qE '^[[:space:]]*void[[:space:]]+escape_to_root_for_init\(void\)' "$profile_c"; then
+        echo "::error::app_profile.c still defines escape_to_root_for_init() as void"
+        echo "::error::while the header now declares int. Prototype mismatch."
+        exit 1
+      fi
+    fi
+  fi
+}
+
+# Reject files we knowingly resolve above. Anything else is a real conflict.
+susfs_reject_is_known() {
+  case "$1" in
+    */kernel/Kbuild.rej) return 0 ;;
+    */kernel/core/init.c.rej) return 0 ;;
+    */kernel/policy/app_profile.h.rej) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 patch_kernelsu_for_susfs() {
@@ -70,56 +162,52 @@ patch_kernelsu_for_susfs() {
     exit 1
   }
 
-  # `git apply --reject` is the right tool here.
-  #
-  # A three-way merge is impossible: the patch's base blobs live in the susfs
-  # author's own fork and are not objects in the SukiSU-Ultra repository, so
-  # --3way always reports "repository lacks the necessary blob" no matter how
-  # deep we clone.
-  #
-  # --reject applies every hunk that fits and writes the rest to .rej, with no
-  # fuzzy context matching and no partial rewrites of the files it cannot
-  # handle. That gives us an exact, minimal list of what actually drifted.
+  # `git apply --reject` applies every hunk that fits and writes the rest to
+  # .rej, with no fuzzy context matching and no partial rewrites. A three-way
+  # merge is impossible here: the patch's base blobs live in the susfs author's
+  # fork, so --3way always reports "lacks the necessary blob".
   echo "==== Applying susfs KernelSU patch (git apply --reject) ===="
-  local apply_rc=0
-  git -C "$ksu_repo_dir" apply --reject --whitespace=nowarn "$patch_name" 2>&1 || apply_rc=$?
+  git -C "$ksu_repo_dir" apply --reject --whitespace=nowarn "$patch_name" 2>&1 || true
 
-  local rejects
-  rejects="$(find "$ksu_repo_dir" -name '*.rej' | sort)"
-
-  if [[ -n "$rejects" ]]; then
-    echo "==== FILES THAT DID NOT APPLY ===="
-    local rej target
-    printf '%s\n' "$rejects" | while IFS= read -r rej; do
-      [[ -z "$rej" ]] && continue
-      target="${rej%.rej}"
-      echo "########## REJECT: ${rej} ##########"
+  local unexpected=0
+  local rej
+  while IFS= read -r rej; do
+    [[ -z "$rej" ]] && continue
+    if susfs_reject_is_known "$rej"; then
+      echo "[i] Known drift, handled explicitly: ${rej#"$ksu_repo_dir"/}"
+    else
+      echo "########## UNEXPECTED REJECT: ${rej} ##########"
       cat "$rej"
       echo
+      local target="${rej%.rej}"
       if [[ -f "$target" ]]; then
         echo "########## CURRENT ${target} ##########"
         cat -n "$target"
         echo
       fi
-    done
+      unexpected=1
+    fi
+  done < <(find "$ksu_repo_dir" -name '*.rej' | sort)
+
+  if [[ "$unexpected" -ne 0 ]]; then
+    echo "::error::susfs KernelSU patch produced rejects we do not know how to"
+    echo "::error::resolve. susfs and SukiSU-Ultra have drifted further apart."
+    exit 1
   fi
 
-  # susfs must end up wired into the KernelSU Kconfig; that is the difference
-  # between "susfs is built in" and "susfs silently does nothing".
-  if ! grep -q 'KSU_SUSFS' "$kconfig_file"; then
+  resolve_known_susfs_ksu_drift "$ksu_dir"
+
+  find "$ksu_repo_dir" -name '*.rej' -delete
+  find "$ksu_repo_dir" -name '*.orig' -delete
+
+  # The real gate: susfs must be wired into the KernelSU Kconfig, or nothing
+  # downstream can enable it and susfs would silently be a no-op.
+  grep -q 'KSU_SUSFS' "$kconfig_file" || {
     echo "::error::KSU_SUSFS is missing from $kconfig_file after patching."
-    echo "::error::susfs would be a no-op; refusing to continue."
     exit 1
-  fi
+  }
 
-  if [[ -n "$rejects" ]]; then
-    echo "::error::susfs KernelSU patch left rejects (see the dumps above)."
-    echo "::error::susfs and SukiSU-Ultra have drifted in these files only;"
-    echo "::error::everything else applied cleanly."
-    exit 1
-  fi
-
-  echo "[+] susfs KernelSU patch applied cleanly; KSU_SUSFS is wired into Kconfig."
+  echo "[+] susfs KernelSU patch applied; known drift resolved; KSU_SUSFS wired in."
 }
 
 patch_resukisu_susfs_runtime_compat() {
