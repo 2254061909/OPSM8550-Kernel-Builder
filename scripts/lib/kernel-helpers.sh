@@ -123,13 +123,33 @@ enable_resukisu_kpm_configs() {
     CONFIG_KALLSYMS_ALL
 }
 
-# The parent symbols matter as much as the leaf ones. FUNCTION_TRACER depends
-# on FTRACE (the "Tracers" menu switch) and both depend on TRACING_SUPPORT;
-# STACK_TRACER additionally needs FUNCTION_TRACER. Writing only the leaves into
-# .config does nothing: olddefconfig silently drops any symbol whose
-# dependencies are unmet, and the build then reports ftrace as unavailable.
+# ---------------------------------------------------------------------------
+# ftrace / debug tracing -- OPT-IN, and for good reason.
+#
+# Turning these on breaks boot on devices that keep the stock vendor_dlkm:
+# CONFIG_TRACING and friends change the layout of core structures such as
+# task_struct, while the hundreds of .ko files in vendor_dlkm were compiled
+# against the stock kernel. They then fail to load -- touchscreen, charger,
+# display -- and the device never finishes booting.
+#
+# The vendor fragments say so explicitly. ingres' debugfs.config sets:
+#     CONFIG_DEBUG_FS=n   CONFIG_PAGE_OWNER=n   CONFIG_PAGE_PINNER=n
+# That is a deliberate production choice, and forcing DEBUG_FS back to y
+# after the fragments have been merged overrides it.
+#
+# So: only enable this when ENABLE_FTRACE=1 is explicitly requested, and
+# never silently. A kernel that boots is worth more than one that traces.
+# ---------------------------------------------------------------------------
 enable_ftrace_debug_configs() {
   local config_file="$1"
+
+  if [[ "${ENABLE_FTRACE:-0}" != "1" ]]; then
+    return 0
+  fi
+
+  # Parent symbols matter as much as the leaves: FUNCTION_TRACER depends on
+  # FTRACE, which depends on TRACING_SUPPORT. olddefconfig silently drops any
+  # symbol whose dependencies are unmet.
   enable_config_values "$config_file" \
     CONFIG_TRACING_SUPPORT \
     CONFIG_FTRACE \
@@ -140,6 +160,10 @@ enable_ftrace_debug_configs() {
     CONFIG_DEBUG_FS \
     CONFIG_FTRACE_SYSCALLS \
     CONFIG_STACK_TRACER
+
+  echo "[!] ftrace/debug tracing enabled by request (ENABLE_FTRACE=1)."
+  echo "[!] This changes core struct layouts. If the device keeps its stock"
+  echo "[!] vendor_dlkm modules, they may fail to load and it may not boot."
 }
 
 apply_variant_configs() {
