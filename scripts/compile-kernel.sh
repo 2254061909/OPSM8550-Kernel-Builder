@@ -14,7 +14,7 @@
 #   GITHUB_WORKSPACE CLANG_VERSION SOC BUILD_CONFIGS SOURCE_LAYOUT
 #   OFFICIAL_BUILD_TARGET KSU_TYPE KERNEL_BRANCH
 #   SUSFS_REF / SUSFS_PATCH_FILE (susfs variants only)
-#   ENABLE_FTRACE=1 (optional; see the warning in kernel-helpers.sh)
+#   FTRACE_LEVEL=none|trace|full (default trace; see kernel-helpers.sh)
 #
 set -euo pipefail
 
@@ -37,14 +37,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${KSU_TYPE:?}"
 : "${KERNEL_BRANCH:?}"
 
+FTRACE_LEVEL="${FTRACE_LEVEL:-trace}"
+export FTRACE_LEVEL
+
 IS_KPM_BUILD=0
 IS_SUSFS_BUILD=0
 IS_KSU_BUILD=0
-WANT_FTRACE=0
 if [[ "$KSU_TYPE" == *KPM* ]]; then IS_KPM_BUILD=1; fi
 if [[ "$KSU_TYPE" == *susfs* ]]; then IS_SUSFS_BUILD=1; fi
 if [[ "$KSU_TYPE" != "None" ]]; then IS_KSU_BUILD=1; fi
-if [[ "${ENABLE_FTRACE:-0}" == "1" ]]; then WANT_FTRACE=1; fi
 
 # ---- Toolchain / ccache env --------------------------------------------------
 CLANG_ROOT="${GITHUB_WORKSPACE}/toolchains/${CLANG_VERSION}/bin"
@@ -71,6 +72,11 @@ export OBJDUMP="${CLANG_ROOT}/llvm-objdump"
 export STRIP="${CLANG_ROOT}/llvm-strip"
 
 cd "${SOC}"
+
+echo "==== BUILD REQUEST ===="
+echo "ksu_type     : ${KSU_TYPE}"
+echo "kernel_branch: ${KERNEL_BRANCH}"
+echo "ftrace_level : ${FTRACE_LEVEL}"
 
 # ---- KSU variant -------------------------------------------------------------
 install_ksu_variant "${KSU_TYPE}"
@@ -163,16 +169,28 @@ assert_config_not_y() {
   fi
 }
 
-if [[ "$WANT_FTRACE" -eq 1 ]]; then
-  assert_config_y CONFIG_FTRACE           "ftrace menu switch; the other tracers depend on it"
-  assert_config_y CONFIG_FUNCTION_TRACER  "ENABLE_FTRACE=1 was requested"
-  assert_config_y CONFIG_DYNAMIC_FTRACE   "ENABLE_FTRACE=1 was requested"
-  assert_config_y CONFIG_DEBUG_FS         "ftrace needs debugfs to expose its interface"
-  assert_config_y CONFIG_FTRACE_SYSCALLS  "ENABLE_FTRACE=1 was requested"
-  assert_config_y CONFIG_STACK_TRACER     "ENABLE_FTRACE=1 was requested"
-else
-  echo "  [i]    ftrace not requested (ENABLE_FTRACE unset); vendor config kept as-is"
-fi
+case "$FTRACE_LEVEL" in
+  trace)
+    assert_config_y CONFIG_FTRACE           "tracers menu switch"
+    assert_config_y CONFIG_FUNCTION_TRACER  "ftrace_level=trace"
+    assert_config_y CONFIG_DYNAMIC_FTRACE   "ftrace_level=trace"
+    assert_config_y CONFIG_FTRACE_SYSCALLS  "ftrace_level=trace"
+    assert_config_y CONFIG_STACK_TRACER     "ftrace_level=trace"
+    # Not asserting DEBUG_FS either way: 'trace' leaves it exactly as the
+    # vendor fragments set it, which on ingres means n.
+    ;;
+  full)
+    assert_config_y CONFIG_FTRACE           "tracers menu switch"
+    assert_config_y CONFIG_FUNCTION_TRACER  "ftrace_level=full"
+    assert_config_y CONFIG_DYNAMIC_FTRACE   "ftrace_level=full"
+    assert_config_y CONFIG_FTRACE_SYSCALLS  "ftrace_level=full"
+    assert_config_y CONFIG_STACK_TRACER     "ftrace_level=full"
+    assert_config_y CONFIG_DEBUG_FS         "ftrace_level=full"
+    ;;
+  none)
+    echo "  [i]    ftrace_level=none; vendor tracing config kept as-is"
+    ;;
+esac
 
 if [[ "$IS_KSU_BUILD" -eq 1 ]]; then
   assert_config_y CONFIG_KSU "root support was requested"
@@ -200,7 +218,7 @@ echo "[+] Preflight passed."
 # Record how the tracing options ended up, so a non-booting build can be
 # correlated with them afterwards.
 echo "==== TRACING / DEBUGFS CONFIG AS BUILT ===="
-grep -E '^(# )?CONFIG_(TRACING|FTRACE|FUNCTION_TRACER|DYNAMIC_FTRACE|DEBUG_FS|STACK_TRACER|PAGE_OWNER|PAGE_PINNER)[ =]' out/.config || true
+grep -E '^(# )?CONFIG_(TRACING|FTRACE|FUNCTION_TRACER|DYNAMIC_FTRACE|DEBUG_FS|STACK_TRACER|FTRACE_SYSCALLS|PAGE_OWNER|PAGE_PINNER)[ =]' out/.config || true
 
 # ---- Build -------------------------------------------------------------------
 ccache -z || true
@@ -250,8 +268,8 @@ if [[ -f out/vmlinux ]]; then
   if [[ "$IS_KPM_BUILD" -eq 1 ]]; then
     assert_symbol '[ _]kpm|[ _]KPM' "the KPM objects did not get linked in"
   fi
-  if [[ "$WANT_FTRACE" -eq 1 ]]; then
-    assert_symbol ' ftrace_' "ftrace did not get compiled in"
+  if [[ "$FTRACE_LEVEL" != "none" ]]; then
+    assert_symbol ' ftrace_' "function tracing did not get compiled in"
   fi
 
   if [[ "$SYMBOLS_FAILED" -ne 0 ]]; then
@@ -331,4 +349,4 @@ fi
 
 ccache -sv || true
 test -f out/arch/arm64/boot/Image
-echo "[+] Build complete."
+echo "[+] Build complete (ftrace_level=${FTRACE_LEVEL})."
