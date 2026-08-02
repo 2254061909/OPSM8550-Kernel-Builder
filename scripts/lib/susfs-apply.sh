@@ -38,20 +38,30 @@ patch_susfs_kernelsu_layout() {
   fi
 }
 
-# A rejected hunk only matters to us if it actually carries susfs content.
-# susfs4ksu's KernelSU patch is cut against whatever SukiSU tree the susfs
-# author happened to have, so it also drags along unrelated refactors of that
-# snapshot (e.g. flattening the ksu_late_loaded branch, dropping the LKM
-# kobject_del). Those hunks conflict with a newer tree and applying them would
-# actively remove upstream features.
-#
-# Rule: if none of a reject's added lines mention susfs, the hunk contributes no
-# susfs functionality and is safe to drop. If any added line mentions susfs, the
-# reject is real and the build must stop.
-susfs_reject_is_benign() {
-  local rej="$1"
-  # Added lines only ('+' but not the '+++' file header).
-  if grep -E '^\+' "$rej" | grep -v '^+++' | grep -qi 'susfs'; then
+# Restore the KSU worktree to pristine HEAD. Essential between patch attempts:
+# a half-applied patch leaves files that are valid to neither side, and the next
+# strategy would then be operating on garbage.
+reset_ksu_tree() {
+  local ksu_repo_dir="$1"
+  git -C "$ksu_repo_dir" checkout -- . 2>/dev/null || true
+  git -C "$ksu_repo_dir" clean -fd 2>/dev/null || true
+  find "$ksu_repo_dir" -name '*.rej' -delete 2>/dev/null || true
+  find "$ksu_repo_dir" -name '*.orig' -delete 2>/dev/null || true
+}
+
+# Any conflict markers left behind mean the merge did not actually resolve.
+assert_no_conflict_markers() {
+  local dir="$1"
+  local hits
+  hits="$(grep -rlE '^(<<<<<<<|>>>>>>>) ' "$dir" --include='*.c' --include='*.h' 2>/dev/null || true)"
+  if [[ -n "$hits" ]]; then
+    echo "::error::Conflict markers left in the KernelSU tree after merging:"
+    printf '%s\n' "$hits"
+    local f
+    printf '%s\n' "$hits" | while IFS= read -r f; do
+      echo "---------- ${f} ----------"
+      grep -nE -A5 -B5 '^(<<<<<<<|=======|>>>>>>>)' "$f" | head -n 60
+    done
     return 1
   fi
   return 0
@@ -60,7 +70,8 @@ susfs_reject_is_benign() {
 patch_kernelsu_for_susfs() {
   local ksu_repo_dir="$1"
   local ksu_dir="$2"
-  local patch_file="${ksu_repo_dir}/10_enable_susfs_for_ksu.patch"
+  local patch_name="10_enable_susfs_for_ksu.patch"
+  local patch_file="${ksu_repo_dir}/${patch_name}"
   local kconfig_file="${ksu_dir}/Kconfig"
 
   test -f "$kconfig_file" || {
@@ -78,61 +89,64 @@ patch_kernelsu_for_susfs() {
     exit 1
   }
 
-  # --batch: never prompt for "File to patch:" -- an unattended runner has no
-  #          stdin, and the prompts turn a clean failure into a wall of noise.
-  # --forward: skip hunks that are already applied instead of asking.
-  local patch_rc=0
-  (
-    cd "$ksu_repo_dir"
-    patch -p1 --batch --forward < "$(basename "$patch_file")"
-  ) || patch_rc=$?
-
-  local blocking=0
-  local rej
-  while IFS= read -r rej; do
-    [[ -z "$rej" ]] && continue
-    echo "---------- REJECT: ${rej} ----------"
-    cat "$rej"
-    echo
-
-    if susfs_reject_is_benign "$rej"; then
-      echo "[+] No susfs content in this reject -- it is an unrelated refactor"
-      echo "    from the susfs author's tree snapshot. Dropping it and keeping"
-      echo "    the upstream code as-is."
-      rm -f "$rej"
+  # Strategy 1: three-way merge.
+  #
+  # susfs4ksu's patch is cut against whatever SukiSU snapshot the susfs author
+  # had. Plain `patch` matches by context lines only, so on a drifted tree it
+  # applies some hunks, rejects others, and can leave a file that is valid to
+  # neither side (we watched it eat an #include block and the leading "//" of a
+  # comment). `git apply -3` instead reconstructs the patch's base blobs from
+  # the index lines and does a real merge, which is exactly the right tool for
+  # version drift. It also fails atomically.
+  echo "==== Applying susfs KernelSU patch (three-way merge) ===="
+  if git -C "$ksu_repo_dir" apply --3way --whitespace=nowarn "$patch_name" 2>&1; then
+    if assert_no_conflict_markers "$ksu_dir"; then
+      echo "[+] Three-way merge applied cleanly."
     else
-      echo "::error::This reject adds susfs code and must be resolved:"
-      echo "::error::  ${rej}"
-      local target="${rej%.rej}"
-      if [[ -f "$target" ]]; then
-        echo "---------- current ${target} (first 80 lines) ----------"
-        head -n 80 "$target"
-        echo
-      fi
-      blocking=1
+      echo "::error::Three-way merge produced conflicts that need manual resolution."
+      exit 1
     fi
-  done < <(find "$ksu_repo_dir" -name '*.rej' | sort)
+  else
+    echo "[!] Three-way merge failed (missing base blobs or real conflicts)."
+    echo "[!] Resetting the tree and falling back to context matching."
+    reset_ksu_tree "$ksu_repo_dir"
 
-  if [[ "$blocking" -ne 0 ]]; then
-    echo "::error::The susfs KernelSU patch left unresolved susfs-bearing rejects."
-    echo "::error::Patch: $patch_file"
-    echo "::error::Tree:  $ksu_repo_dir"
-    exit 1
+    # Strategy 2: context matching, but WITHOUT --forward. We want a hunk to
+    # either apply or be rejected; we do not want a partially rewritten file.
+    local patch_rc=0
+    (
+      cd "$ksu_repo_dir"
+      patch -p1 --batch < "$patch_name"
+    ) || patch_rc=$?
+
+    local rej
+    local blocking=0
+    while IFS= read -r rej; do
+      [[ -z "$rej" ]] && continue
+      echo "---------- REJECT: ${rej} ----------"
+      cat "$rej"
+      echo
+      blocking=1
+    done < <(find "$ksu_repo_dir" -name '*.rej' | sort)
+
+    if [[ "$blocking" -ne 0 ]] || [[ "$patch_rc" -ne 0 ]]; then
+      echo "::error::susfs KernelSU patch could not be applied by either strategy."
+      echo "::error::Patch: $patch_file"
+      echo "::error::Tree:  $ksu_repo_dir"
+      echo "::error::The susfs release and the SukiSU-Ultra revision have drifted"
+      echo "::error::apart. Pin SUKISU_KPM_REF to a revision matching this susfs."
+      exit 1
+    fi
   fi
 
-  # The real gate: regardless of hunk-level noise, susfs must actually be
-  # wired into the KernelSU Kconfig, or nothing downstream can enable it.
+  # The real gate: susfs must be wired into the KernelSU Kconfig, or nothing
+  # downstream can enable it and susfs would silently be a no-op.
   grep -q 'KSU_SUSFS' "$kconfig_file" || {
     echo "::error::Patch finished but KSU_SUSFS is still missing from $kconfig_file"
-    echo "::error::susfs would silently be a no-op; refusing to continue."
     exit 1
   }
 
-  if [[ "$patch_rc" -ne 0 ]]; then
-    echo "[+] susfs KernelSU patch applied; only benign non-susfs hunks were rejected."
-  else
-    echo "[+] susfs KernelSU patch applied cleanly."
-  fi
+  echo "[+] susfs is wired into the KernelSU Kconfig."
 }
 
 patch_resukisu_susfs_runtime_compat() {
@@ -248,6 +262,8 @@ apply_susfs_full() {
   echo "branch: $susfs_ref"
   ( cd susfs && git log -1 --format='commit: %H%ncommit date: %ci' ) || true
   grep -E '^#define SUSFS_VERSION' ./susfs/kernel_patches/include/linux/susfs.h 2>/dev/null || true
+  echo "==== KSU SOURCE ===="
+  git -C "$ksu_repo_dir" log -1 --format='commit: %H%ncommit date: %ci' 2>/dev/null || true
 
   (
     cd susfs
