@@ -9,15 +9,16 @@
 # PINNED UPSTREAM REFS
 #
 # As of 2026-08 no single upstream branch provides root + susfs + KPM:
-#   ReSukiSU main        -> root + native susfs, KPM deliberately removed
-#   SukiSU-Ultra main    -> root + KPM, susfs removed in the 4.x rewrite
-#   SukiSU-Ultra v3.1.7  -> root + KPM + flat layout that susfs4ksu patches
+#   ReSukiSU main       -> root + native susfs, KPM deliberately removed
+#   SukiSU-Ultra main   -> root + KPM, susfs must come from susfs4ksu
+#   susfs-* branches    -> deleted upstream, do not reference them
 #
-# The susfs-main / susfs-dev / susfs-stable branches no longer exist, so the
-# KPM variant is pinned to the v3.1.7 tag. Bump this deliberately, never
-# implicitly.
+# susfs4ksu's 10_enable_susfs_for_ksu.patch is maintained against the MODERN
+# modular layout (kernel/core/, kernel/policy/, kernel/supercall/, ...), so the
+# KSU tree must be a 4.x-style tree. The old flat v3.1.x tags do NOT work: the
+# patch cannot find a single file and silently no-ops.
 # ---------------------------------------------------------------------------
-SUKISU_KPM_REF="${SUKISU_KPM_REF:-v3.1.7}"
+SUKISU_KPM_REF="${SUKISU_KPM_REF:-main}"
 
 setup_kernelsu_repo() {
   local owner="$1"
@@ -74,11 +75,10 @@ setup_kernelsu_next() {
   setup_kernelsu_repo "KernelSU-Next" "KernelSU-Next" "$requested_ref" 1
 }
 
-# The KPM variant only works if the installed tree really is the pinned
-# SukiSU-Ultra release: KPM sources present, and the flat (pre-4.x) layout that
-# the susfs4ksu KernelSU patch expects. Upstream's setup.sh swallows a failed
-# checkout ("|| echo Checkout default branch") and silently leaves you on main,
-# which is exactly how a KPM-capable-but-susfs-less tree slipped through before.
+# The KPM variant needs a tree that has BOTH the KPM sources and the modular
+# layout that susfs4ksu's KernelSU patch targets. Upstream's setup.sh swallows a
+# failed checkout ("|| echo Checkout default branch"), so we clone the ref
+# ourselves and verify the result rather than trusting it.
 verify_kpm_capable_driver() {
   local driver_dir ksu_kernel_dir failed=0
   driver_dir="$(detect_kernelsu_driver_dir)" || {
@@ -103,14 +103,15 @@ verify_kpm_capable_driver() {
     failed=1
   fi
 
-  # Flat layout check: the susfs4ksu KernelSU patch targets core_hook.c at the
-  # top level. The 4.x tree moved this to core/init.c and the patch shreds it.
-  if [[ -f "${ksu_kernel_dir}/core_hook.c" ]]; then
-    echo "  [OK]   flat layout (core_hook.c) -- susfs4ksu patch will apply"
+  # Modular layout check. susfs4ksu's KernelSU patch addresses
+  # kernel/core/init.c, kernel/policy/, kernel/supercall/ etc. On an old flat
+  # tree (core_hook.c at top level) every hunk is skipped with
+  # "can't find file to patch" and susfs silently never gets enabled.
+  if [[ -f "${ksu_kernel_dir}/core/init.c" ]] && [[ -d "${ksu_kernel_dir}/supercall" ]]; then
+    echo "  [OK]   modular layout (core/init.c, supercall/) -- susfs4ksu patch targets this"
   else
-    echo "  [FAIL] no core_hook.c -- this is a 4.x-style tree (core/init.c),"
-    echo "         the susfs4ksu KernelSU patch will not apply to it."
-    echo "         Most likely the pinned ref was not checked out."
+    echo "  [FAIL] not a modular tree; susfs4ksu's KernelSU patch will match nothing."
+    echo "         Old flat trees (core_hook.c at top level) are NOT usable."
     failed=1
   fi
 
@@ -121,7 +122,7 @@ verify_kpm_capable_driver() {
     exit 1
   fi
 
-  echo "[+] KSU tree verified: KPM sources + flat layout for susfs."
+  echo "[+] KSU tree verified: KPM sources + modular layout for susfs."
   export KSU_KERNEL_DIR="$ksu_kernel_dir"
 }
 
@@ -149,11 +150,10 @@ install_ksu_variant() {
         "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash -s main
       ;;
     "ReSukiSU-with-susfs-KPM")
-      # Clone the pinned tag ourselves instead of piping upstream's setup.sh:
-      # setup.sh treats a failed checkout as a warning and continues on the
-      # default branch, which silently produces a tree without susfs support.
-      # setup_kernelsu_repo uses `git clone -b <ref>` and hard-fails instead.
-      echo "[+] KPM variant: pinning SukiSU-Ultra to ${SUKISU_KPM_REF}."
+      # Clone ourselves instead of piping upstream's setup.sh: setup.sh treats a
+      # failed checkout as a warning and silently continues on the default
+      # branch, which is how a wrong tree slipped through before.
+      echo "[+] KPM variant: SukiSU-Ultra @ ${SUKISU_KPM_REF}."
       setup_kernelsu_repo "SukiSU-Ultra" "SukiSU-Ultra" "$SUKISU_KPM_REF" 0
       verify_kpm_capable_driver
       ;;
