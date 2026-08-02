@@ -3,15 +3,19 @@
 # Post-patch/post-build verification helpers. Sourced, not executed.
 #
 
-# Does this KSU tree use the ReSukiSU-style static-key hook plumbing in
-# runtime/ksud_integration.c? Decide from the tree itself, never from the
-# preset label: the "ReSukiSU + susfs + KPM" preset actually installs
-# SukiSU-Ultra (only it ships KPM), and SukiSU-Ultra uses a different hook
-# architecture (hook/syscall_hook.c) with no init_rc/input static keys at all.
+# Does this KSU tree use the ReSukiSU-style static-key hook plumbing that
+# patch_resukisu_susfs_runtime_compat knows how to fix up?
+#
+# This MUST use the same gate as that function, otherwise the fix is skipped
+# while the verification still demands its result. Matching on the bare
+# ksu_init_rc_hook / ksu_input_hook names is too loose: SukiSU-Ultra has hooks
+# by those names natively, with no relation to susfs static keys.
+#
+# The gate is a susfs-conditional block in runtime/ksud_integration.c.
 ksu_tree_uses_resukisu_hook_plumbing() {
   local runtime_file="$1"
   [[ -f "$runtime_file" ]] || return 1
-  grep -Eq 'ksu_init_rc_hook|ksu_input_hook' "$runtime_file" || return 1
+  grep -q 'CONFIG_KSU_SUSFS' "$runtime_file" || return 1
   return 0
 }
 
@@ -49,6 +53,12 @@ verify_susfs_source_integration() {
     exit 1
   }
 
+  # susfs must be callable from the KSU driver, whatever the hook architecture.
+  grep -R -q 'susfs_init' "$ksu_kernel_dir" || {
+    echo "::error::KernelSU tree never calls susfs_init(), so susfs would never start."
+    exit 1
+  }
+
   if grep -R -q 'ksu_selinux_hide_running' security/selinux; then
     local fake_state_def_re='^[[:space:]]*(__[A-Za-z0-9_]+[[:space:]]+)*struct[[:space:]]+selinux_state[[:space:]]+fake_state([[:space:];=]|$)'
     local running_def_re='^[[:space:]]*(__[A-Za-z0-9_]+[[:space:]]+)*bool[[:space:]]+ksu_selinux_hide_running([[:space:];=]|$)'
@@ -62,12 +72,6 @@ verify_susfs_source_integration() {
       exit 1
     }
   fi
-
-  # susfs must be callable from the KSU driver, whatever the hook architecture.
-  grep -R -q 'susfs_init' "$ksu_kernel_dir" || {
-    echo "::error::KernelSU tree never calls susfs_init(), so susfs would never start."
-    exit 1
-  }
 
   if ksu_tree_uses_resukisu_hook_plumbing "$runtime_file"; then
     grep -Eq '^[[:space:]]*DEFINE_STATIC_KEY_TRUE\(ksu_is_init_rc_hook_enabled\);$' "$runtime_file" || {
@@ -92,10 +96,11 @@ verify_susfs_source_integration() {
       exit 1
     fi
 
-    echo "[+] ReSukiSU-style hook plumbing verified."
+    echo "[+] ReSukiSU-style susfs hook plumbing verified."
   else
-    echo "[i] This KSU tree does not use ReSukiSU static-key hook plumbing;"
-    echo "    skipping those checks (SukiSU-Ultra uses hook/syscall_hook.c)."
+    echo "[i] runtime/ksud_integration.c has no susfs-conditional hook block;"
+    echo "    skipping the ReSukiSU static-key checks. This tree wires susfs in"
+    echo "    through its own hook architecture instead."
   fi
 
   {
