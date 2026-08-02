@@ -66,6 +66,17 @@ on:
           - ReSukiSU + susfs
           - ReSukiSU + susfs + KPM
           - ReSukiSU + susfs (build both: with KPM and without KPM)
+      enable_ftrace:
+        description: >-
+          Enable ftrace/debug tracing. WARNING: changes core struct layouts and
+          overrides the vendor's DEBUG_FS=n. Stock vendor_dlkm modules may fail
+          to load and the device may not boot. Leave off unless you need it.
+        required: true
+        type: choice
+        default: "no"
+        options:
+          - "no"
+          - "yes"
 
 jobs:
   prepare:
@@ -221,6 +232,8 @@ jobs:
         run: bash scripts/clone-sources.sh
 
       - name: Compile kernel
+        env:
+          ENABLE_FTRACE: ${{ inputs.enable_ftrace == 'yes' && '1' || '0' }}
         run: bash "${GITHUB_WORKSPACE}/scripts/compile-kernel.sh"
 
       - name: Make AnyKernel3 zip
@@ -243,10 +256,11 @@ jobs:
             "$ZIP_FILE" \
             "$IMAGE_FILE"
 
-      - name: Publish susfs diagnostics
-        if: always()
-        run: bash scripts/publish-diagnostics.sh
-
+      # Only what is actually needed to flash:
+      #   Image            -> the kernel to put into boot.img (KPM-patched)
+      #   Image.unpatched  -> same kernel without the KPM patch, the fallback
+      #   *.zip            -> AnyKernel3 flashable package
+      # build.log is kept because a failed build is unreadable without it.
       - name: Upload build artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -254,17 +268,10 @@ jobs:
           name: build-${{ steps.resolve.outputs.soc }}-${{ steps.resolve.outputs.source_slug }}-${{ steps.resolve.outputs.ksu_type }}-${{ env.BUILD_TIMESTAMP }}
           if-no-files-found: ignore
           path: |
-            ${{ github.workspace }}/${{ steps.resolve.outputs.soc }}/build.log
-            ${{ github.workspace }}/${{ steps.resolve.outputs.soc }}/ksu-driver-build.log
-            ${{ github.workspace }}/${{ steps.resolve.outputs.soc }}/kpm-patch.log
-            ${{ github.workspace }}/${{ steps.resolve.outputs.soc }}/vmlinux-symbols.txt
-            ${{ github.workspace }}/${{ steps.resolve.outputs.soc }}/susfs-source-proof.txt
-            ${{ github.workspace }}/${{ steps.resolve.outputs.soc }}/susfs-hook-proof.txt
-            ${{ github.workspace }}/${{ steps.resolve.outputs.soc }}/susfs-proof.txt
-            ${{ github.workspace }}/${{ steps.resolve.outputs.soc }}/out/.config
             ${{ github.workspace }}/${{ steps.resolve.outputs.soc }}/out/arch/arm64/boot/Image
             ${{ github.workspace }}/${{ steps.resolve.outputs.soc }}/out/arch/arm64/boot/Image.unpatched
             ${{ github.workspace }}/${{ env.ZIP_NAME }}.zip
+            ${{ github.workspace }}/${{ steps.resolve.outputs.soc }}/build.log
 
       - name: Save ccache
         if: always() && steps.ccache-restore.outputs.cache-primary-key != '' && hashFiles('.ccache/**') != ''
