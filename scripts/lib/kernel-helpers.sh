@@ -123,9 +123,18 @@ enable_resukisu_kpm_configs() {
     CONFIG_KALLSYMS_ALL
 }
 
+# The parent symbols matter as much as the leaf ones. FUNCTION_TRACER depends
+# on FTRACE (the "Tracers" menu switch) and both depend on TRACING_SUPPORT;
+# STACK_TRACER additionally needs FUNCTION_TRACER. Writing only the leaves into
+# .config does nothing: olddefconfig silently drops any symbol whose
+# dependencies are unmet, and the build then reports ftrace as unavailable.
 enable_ftrace_debug_configs() {
   local config_file="$1"
   enable_config_values "$config_file" \
+    CONFIG_TRACING_SUPPORT \
+    CONFIG_FTRACE \
+    CONFIG_TRACING \
+    CONFIG_GENERIC_TRACER \
     CONFIG_FUNCTION_TRACER \
     CONFIG_DYNAMIC_FTRACE \
     CONFIG_DEBUG_FS \
