@@ -43,6 +43,23 @@ patch_susfs_kernelsu_layout() {
   fi
 }
 
+# Line number of the anchor we insert restored #includes after.
+#
+# It MUST be the FIRST #include in the file, not the last. Several KSU sources
+# end with includes inside a conditional block, e.g. core/init.c:
+#
+#     #if defined(CONFIG_STACKPROTECTOR) && ... && defined(MODULE) ...
+#     #include <linux/stackprotector.h>
+#     #include <linux/random.h>          <-- last #include in the file
+#     #endif
+#
+# For a built-in (non-module) build that block is preprocessed away, so
+# anything appended after it is silently invisible to the compiler: the file
+# grows by a line and the build fails with exactly the same errors.
+_first_include_line() {
+  grep -n '^#include' "$1" | head -n 1 | cut -d: -f1
+}
+
 _decl_symbol_name() {
   local line="$1"
   if [[ "$line" == *"("* ]]; then
@@ -73,17 +90,20 @@ restore_includes_deleted_by_susfs_patch() {
 
     [[ "${#to_restore[@]}" -eq 0 ]] && continue
 
-    echo "[+] Restoring ${#to_restore[@]} #include(s) removed from ${file}:"
+    local anchor
+    anchor="$(_first_include_line "$abs")"
+    if [[ -z "$anchor" ]]; then
+      echo "[!] ${file}: no #include anchor found, skipping restore"
+      continue
+    fi
+
+    echo "[+] Restoring ${#to_restore[@]} #include(s) in ${file} (after line ${anchor}):"
     printf '      %s\n' "${to_restore[@]}"
 
-    local last_inc
-    last_inc="$(grep -n '^#include' "$abs" | tail -n 1 | cut -d: -f1)"
-    if [[ -n "$last_inc" ]]; then
-      local tmp="/tmp/ksu_inc.$$"
-      printf '%s\n' "${to_restore[@]}" > "$tmp"
-      sed -i "${last_inc}r ${tmp}" "$abs"
-      rm -f "$tmp"
-    fi
+    local tmp="/tmp/ksu_inc.$$"
+    printf '%s\n' "${to_restore[@]}" > "$tmp"
+    sed -i "${anchor}r ${tmp}" "$abs"
+    rm -f "$tmp"
     restored=1
   done < <(git -C "$ksu_repo_dir" diff --name-only -- '*.c' '*.h')
 
@@ -119,7 +139,7 @@ restore_declarations_deleted_from_ksu_headers() {
 
     [[ "${#to_restore[@]}" -eq 0 ]] && continue
 
-    echo "[+] Restoring ${#to_restore[@]} declaration(s) removed from ${header}:"
+    echo "[+] Restoring ${#to_restore[@]} declaration(s) in ${header}:"
     printf '      %s\n' "${to_restore[@]}"
 
     local guard_line tmp="/tmp/ksu_decl.$$"
@@ -129,7 +149,7 @@ restore_declarations_deleted_from_ksu_headers() {
       printf '%s\n' "${to_restore[@]}"
     } > "$tmp"
 
-    if [[ -n "$guard_line" ]]; then
+    if [[ -n "$guard_line" ]] && [[ "$guard_line" -gt 1 ]]; then
       sed -i "$((guard_line - 1))r ${tmp}" "$abs"
     else
       cat "$tmp" >> "$abs"
@@ -144,8 +164,9 @@ restore_declarations_deleted_from_ksu_headers() {
 }
 
 # For every ksu_* function core/init.c calls without a visible declaration,
-# find the header in the tree that declares it and add that #include. Falls
-# back to a local void(void) prototype if nothing declares it.
+# find the header that declares it and include it. Falls back to a local
+# prototype. Also verifies afterwards that nothing is left undeclared, so this
+# never silently hands a broken file to the compiler.
 ensure_init_symbols_declared() {
   set +e
   local ksu_dir="$1"
@@ -155,54 +176,71 @@ ensure_init_symbols_declared() {
     return 0
   fi
 
-  local sym hdr rel decl_re last_inc visible
-  local added_includes=() added_protos=()
-  local called
-  called="$(grep -oE '\bksu_[A-Za-z0-9_]+\(' "$init_c" | sed 's/(//' | sort -u)"
+  local sym hdr rel decl_re anchor visible pass
+  local unresolved=()
 
-  for sym in $called; do
-    decl_re="^[A-Za-z_][A-Za-z0-9_[:space:]\*]*[[:space:]\*]${sym}[[:space:]]*\("
+  # Two passes: the first adds includes, the second re-checks and reports.
+  for pass in 1 2; do
+    unresolved=()
+    local called
+    called="$(grep -oE '\bksu_[A-Za-z0-9_]+\(' "$init_c" | sed 's/(//' | sort -u)"
 
-    visible=0
-    while IFS= read -r rel; do
-      [[ -z "$rel" ]] && continue
-      [[ -f "${ksu_dir}/${rel}" ]] || continue
-      if grep -qE "$decl_re" "${ksu_dir}/${rel}"; then
-        visible=1
-        break
+    for sym in $called; do
+      decl_re="^[A-Za-z_][A-Za-z0-9_[:space:]\*]*[[:space:]\*]${sym}[[:space:]]*\("
+
+      # Declared directly in init.c (a local prototype we added, or a static)?
+      grep -qE "$decl_re" "$init_c" && continue
+
+      # Declared in a header init.c includes, transitively one level deep?
+      visible=0
+      while IFS= read -r rel; do
+        [[ -z "$rel" ]] && continue
+        [[ -f "${ksu_dir}/${rel}" ]] || continue
+        if grep -qE "$decl_re" "${ksu_dir}/${rel}"; then
+          visible=1
+          break
+        fi
+        # one level of nesting: headers included by that header
+        local nested
+        while IFS= read -r nested; do
+          [[ -f "${ksu_dir}/${nested}" ]] || continue
+          if grep -qE "$decl_re" "${ksu_dir}/${nested}"; then
+            visible=1
+            break
+          fi
+        done < <(grep -oE '^#include[[:space:]]+"[^"]+"' "${ksu_dir}/${rel}" 2>/dev/null | sed -E 's/.*"([^"]+)".*/\1/')
+        [[ "$visible" -eq 1 ]] && break
+      done < <(grep -oE '^#include[[:space:]]+"[^"]+"' "$init_c" | sed -E 's/.*"([^"]+)".*/\1/')
+      [[ "$visible" -eq 1 ]] && continue
+
+      [[ "$pass" -eq 2 ]] && { unresolved+=("$sym"); continue; }
+
+      anchor="$(_first_include_line "$init_c")"
+      [[ -z "$anchor" ]] && continue
+
+      hdr="$(grep -rlE "$decl_re" "$ksu_dir" --include='*.h' 2>/dev/null | head -n 1)"
+      if [[ -n "$hdr" ]]; then
+        rel="${hdr#"${ksu_dir}"/}"
+        grep -Fq "#include \"${rel}\"" "$init_c" && continue
+        sed -i "${anchor}a #include \"${rel}\"" "$init_c"
+        echo "[+] core/init.c: ${sym} -> #include \"${rel}\""
+      else
+        sed -i "${anchor}a void ${sym}(void);" "$init_c"
+        echo "[+] core/init.c: ${sym} -> local prototype void ${sym}(void);"
       fi
-    done < <(grep -oE '^#include[[:space:]]+"[^"]+"' "$init_c" | sed -E 's/.*"([^"]+)".*/\1/')
-    [[ "$visible" -eq 1 ]] && continue
-
-    grep -qE "$decl_re" "$init_c" && continue
-
-    hdr="$(grep -rlE "$decl_re" "$ksu_dir" --include='*.h' 2>/dev/null | head -n 1)"
-    last_inc="$(grep -n '^#include' "$init_c" | tail -n 1 | cut -d: -f1)"
-    [[ -z "$last_inc" ]] && continue
-
-    if [[ -n "$hdr" ]]; then
-      rel="${hdr#"${ksu_dir}"/}"
-      grep -Fq "#include \"${rel}\"" "$init_c" && continue
-      sed -i "${last_inc}a #include \"${rel}\"" "$init_c"
-      added_includes+=("${sym} -> ${rel}")
-    else
-      sed -i "${last_inc}a void ${sym}(void);" "$init_c"
-      added_protos+=("$sym")
-    fi
+    done
   done
 
-  if [[ "${#added_includes[@]}" -gt 0 ]]; then
-    echo "[+] Added ${#added_includes[@]} missing #include(s) to core/init.c:"
-    printf '      %s\n' "${added_includes[@]}"
-  fi
-  if [[ "${#added_protos[@]}" -gt 0 ]]; then
-    echo "[+] Added ${#added_protos[@]} local prototype(s) to core/init.c:"
-    printf '      void %s(void);\n' "${added_protos[@]}"
-  fi
-  if [[ "${#added_includes[@]}" -eq 0 && "${#added_protos[@]}" -eq 0 ]]; then
-    echo "[i] All KSU symbols used by core/init.c already have declarations."
+  if [[ "${#unresolved[@]}" -gt 0 ]]; then
+    echo "::error::These symbols used by core/init.c are still undeclared:"
+    printf '::error::  %s\n' "${unresolved[@]}"
+    echo "==== core/init.c include block ===="
+    grep -n '^#include' "$init_c" | head -n 40
+    set -e
+    return 1
   fi
 
+  echo "[+] Every ksu_* symbol used by core/init.c has a visible declaration."
   set -e
   return 0
 }
@@ -254,7 +292,7 @@ resolve_known_susfs_ksu_drift() {
 
   restore_includes_deleted_by_susfs_patch "$ksu_repo_dir"
   restore_declarations_deleted_from_ksu_headers "$ksu_repo_dir"
-  ensure_init_symbols_declared "$ksu_dir"
+  ensure_init_symbols_declared "$ksu_dir" || exit 1
 }
 
 susfs_reject_is_known() {
