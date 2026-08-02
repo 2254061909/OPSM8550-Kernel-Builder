@@ -39,37 +39,85 @@ patch_susfs_kernelsu_layout() {
 }
 
 # ---------------------------------------------------------------------------
-# Known drift between susfs4ksu's KernelSU patch and SukiSU-Ultra main.
+# The susfs KernelSU patch is cut against an older SukiSU snapshot. Its header
+# hunks apply "cleanly" while silently DELETING declarations that only exist in
+# the newer upstream tree -- e.g. `extern bool ksu_late_loaded;`, the
+# ksu_syscall_hook_manager_* API and ksu_lsm_hook_init(). core/init.c still
+# calls those, so the driver fails with a wall of implicit-declaration errors.
 #
-# The patch is cut against an older SukiSU snapshot, so besides the susfs
-# changes it also carries that snapshot's own refactors. Three hunks reject:
+# General rule: susfs only ever needs to ADD things. Anything its header hunks
+# delete is an artifact of its stale base tree, so restoring those declarations
+# is always safe -- duplicate declarations are legal C, and a declaration for an
+# unused symbol is harmless.
+# ---------------------------------------------------------------------------
+restore_declarations_deleted_from_ksu_headers() {
+  local ksu_repo_dir="$1"
+  local header deleted line restored_any=0
+
+  while IFS= read -r header; do
+    [[ -z "$header" ]] && continue
+    local abs="${ksu_repo_dir}/${header}"
+    [[ -f "$abs" ]] || continue
+
+    local to_restore=()
+    while IFS= read -r line; do
+      # Only declaration-shaped lines: `extern ...;` or `type name(...);`
+      [[ "$line" =~ ^extern[[:space:]].*\;$ ]] || \
+      [[ "$line" =~ ^[A-Za-z_][A-Za-z0-9_[:space:]\*]*\(.*\)\;$ ]] || continue
+      # Never resurrect something susfs deliberately reshaped.
+      [[ "$line" == *susfs* ]] && continue
+      # Skip if the declaration is still present after patching.
+      grep -Fxq "$line" "$abs" && continue
+      to_restore+=("$line")
+    done < <(git -C "$ksu_repo_dir" diff -U0 -- "$header" \
+               | grep '^-' | grep -v '^---' | sed 's/^-//')
+
+    [[ "${#to_restore[@]}" -eq 0 ]] && continue
+
+    echo "[+] Restoring ${#to_restore[@]} declaration(s) removed from ${header}:"
+    printf '      %s\n' "${to_restore[@]}"
+
+    # Insert before the final #endif of the include guard, or append.
+    local guard_line
+    guard_line="$(grep -n '^#endif' "$abs" | tail -n 1 | cut -d: -f1)"
+
+    {
+      printf '\n/* Restored: removed by the susfs KernelSU patch, still used upstream. */\n'
+      printf '%s\n' "${to_restore[@]}"
+    } > /tmp/ksu_restore_block.$$
+
+    if [[ -n "$guard_line" ]]; then
+      sed -i "$((guard_line - 1))r /tmp/ksu_restore_block.$$" "$abs"
+    else
+      cat /tmp/ksu_restore_block.$$ >> "$abs"
+    fi
+    rm -f /tmp/ksu_restore_block.$$
+    restored_any=1
+  done < <(git -C "$ksu_repo_dir" diff --name-only -- '*.h')
+
+  if [[ "$restored_any" -eq 0 ]]; then
+    echo "[i] No declarations were removed from KSU headers by the patch."
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Known drift hunks that git apply rejects outright:
 #
-#   kernel/Kbuild        hunk#2  deletes the x86 syscall-dispatcher block.
-#                                No susfs content. Applying it would break
-#                                x86 builds. -> intentionally skipped.
-#
-#   kernel/core/init.c   hunk#3  swaps hook/syscall_hook.h + infra/
-#                                symbol_resolver.h for the older
-#                                hook/setuid_hook.h + feature/sucompat.h.
-#                                No susfs content, and the old entry points
-#                                do not exist here. -> intentionally skipped.
-#
-#   kernel/core/init.c   hunk#7  rewrites the whole init sequence for the
-#                                pre-late-load architecture. The ONLY susfs
-#                                content in it is the susfs_init() call, so
-#                                we inject exactly that and leave the
-#                                surrounding upstream logic intact.
-#
-#   kernel/policy/       hunk#1  changes escape_to_root_for_init() from void
-#     app_profile.h              to int. This one is REQUIRED: app_profile.c
-#                                already patched cleanly and now returns int,
-#                                so the prototype must match or the driver
-#                                will not compile.
-#
-# Each fix is verified after the fact; anything unexpected fails the build.
+#   kernel/Kbuild        #2  deletes the x86 syscall-dispatcher block. No susfs
+#                            content; applying it would break x86. Skipped.
+#   kernel/core/init.c   #3  swaps the current syscall_hook/symbol_resolver
+#                            headers for the older setuid_hook/sucompat ones.
+#                            No susfs content. Skipped.
+#   kernel/core/init.c   #7  rewrites the init sequence for the pre-late-load
+#                            architecture. Its only susfs content is
+#                            susfs_init(), which we inject exactly.
+#   kernel/policy/
+#     app_profile.h      #1  escape_to_root_for_init() void -> int. REQUIRED:
+#                            app_profile.c already patched and returns int.
 # ---------------------------------------------------------------------------
 resolve_known_susfs_ksu_drift() {
-  local ksu_dir="$1"
+  local ksu_repo_dir="$1"
+  local ksu_dir="$2"
   local init_c="${ksu_dir}/core/init.c"
   local profile_h="${ksu_dir}/policy/app_profile.h"
 
@@ -78,8 +126,6 @@ resolve_known_susfs_ksu_drift() {
     if grep -q 'susfs_init();' "$init_c"; then
       echo "[+] init.c already calls susfs_init()."
     else
-      # Insert immediately before the first ksu_supercalls_init() call, which
-      # is where the patch places it relative to the surrounding init order.
       awk '
         !done && /^[[:space:]]*ksu_supercalls_init\(\);[[:space:]]*$/ {
           print "#ifdef CONFIG_KSU_SUSFS"
@@ -93,7 +139,6 @@ resolve_known_susfs_ksu_drift() {
 
       grep -q 'susfs_init();' "$init_c" || {
         echo "::error::Could not inject susfs_init() into ${init_c}."
-        echo "::error::No 'ksu_supercalls_init();' anchor was found."
         grep -n 'ksu_supercalls_init\|kernelsu_init' "$init_c" | head -n 20
         exit 1
       }
@@ -118,7 +163,6 @@ resolve_known_susfs_ksu_drift() {
       exit 1
     fi
 
-    # Cross-check against the definition that the patch already updated.
     local profile_c="${ksu_dir}/policy/app_profile.c"
     if [[ -f "$profile_c" ]] && grep -q 'escape_to_root_for_init' "$profile_c"; then
       if grep -qE '^[[:space:]]*void[[:space:]]+escape_to_root_for_init\(void\)' "$profile_c"; then
@@ -128,6 +172,9 @@ resolve_known_susfs_ksu_drift() {
       fi
     fi
   fi
+
+  # --- 3. put back declarations the patch's header hunks removed ------------
+  restore_declarations_deleted_from_ksu_headers "$ksu_repo_dir"
 }
 
 # Reject files we knowingly resolve above. Anything else is a real conflict.
@@ -195,13 +242,11 @@ patch_kernelsu_for_susfs() {
     exit 1
   fi
 
-  resolve_known_susfs_ksu_drift "$ksu_dir"
+  resolve_known_susfs_ksu_drift "$ksu_repo_dir" "$ksu_dir"
 
   find "$ksu_repo_dir" -name '*.rej' -delete
   find "$ksu_repo_dir" -name '*.orig' -delete
 
-  # The real gate: susfs must be wired into the KernelSU Kconfig, or nothing
-  # downstream can enable it and susfs would silently be a no-op.
   grep -q 'KSU_SUSFS' "$kconfig_file" || {
     echo "::error::KSU_SUSFS is missing from $kconfig_file after patching."
     exit 1
@@ -318,7 +363,6 @@ apply_susfs_full() {
   git clone --depth=1 --no-tags -b "$susfs_ref" \
     https://gitlab.com/simonpunk/susfs4ksu.git susfs
 
-  # Record exactly which revisions we are combining.
   echo "==== SUSFS SOURCE ===="
   echo "branch: $susfs_ref"
   ( cd susfs && git log -1 --format='commit: %H%ncommit date: %ci' ) || true
@@ -373,7 +417,6 @@ apply_susfs_full() {
 
   patch_susfs_kernelsu_layout
 
-  # Export for downstream verification
   export KSU_KERNEL_DIR="$ksu_kernel_dir"
   export KSU_REPO_DIR="$ksu_repo_dir"
 }
