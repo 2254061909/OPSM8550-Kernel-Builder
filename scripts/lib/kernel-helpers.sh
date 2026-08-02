@@ -124,46 +124,59 @@ enable_resukisu_kpm_configs() {
 }
 
 # ---------------------------------------------------------------------------
-# ftrace levels.
+# ftrace levels -- a bisection in progress, on a device that keeps its stock
+# vendor_dlkm (388 modules, CONFIG_MODVERSIONS=y, so symbol CRCs are enforced).
 #
-# Measured on ingres (SM8450, stock vendor_dlkm, CONFIG_MODVERSIONS=y):
+# Measured on ingres (SM8450):
 #
-#   all five options on, including DEBUG_FS  -> does NOT boot
-#   all five off                             -> boots, verified working
+#   none                                            -> BOOTS, verified working
+#   FUNCTION_TRACER DYNAMIC_FTRACE FTRACE_SYSCALLS
+#     STACK_TRACER DEBUG_FS                         -> does NOT boot
+#   FUNCTION_TRACER DYNAMIC_FTRACE FTRACE_SYSCALLS
+#     STACK_TRACER            (no DEBUG_FS)         -> does NOT boot
 #
-# Only those two data points exist; no option has been bisected individually.
+# The second result rules out the theory that DEBUG_FS alone was responsible,
+# even though it was the option with the most outside evidence against it
+# (the vendor's debugfs.config disables it deliberately, and AOSP documents
+# enabling debugfs under "intrusive downstream debug features" with an
+# ABI-mismatch warning). Something in the remaining four also breaks boot.
 #
-# What the stock config already has (config_20251208.txt), i.e. NOT variables:
+# Not variables -- the stock config already has these, and level "none" still
+# gives you tracefs at /sys/kernel/tracing with ~1700 static tracepoints:
 #   CONFIG_TRACING=y  CONFIG_TRACING_SUPPORT=y  CONFIG_FTRACE=y
-# So basic tracefs at /sys/kernel/tracing is present even at level "none".
 #
-# CONFIG_DEBUG_FS is the prime suspect and is never enabled here:
-#   - ingres' own debugfs.config sets DEBUG_FS=n, PAGE_OWNER=n, PAGE_PINNER=n
-#     as a deliberate production choice
-#   - AOSP documents enabling debugfs under "intrusive downstream debug
-#     features" and warns about implicit module config dependencies causing
-#     ABI mismatches between the GKI kernel and vendor modules
-#   - ftrace does not need it: tracefs has been independent of debugfs since
-#     Linux 4.1, so the interface lives at /sys/kernel/tracing either way
+# Next suspect, hence the "func" level: CONFIG_FTRACE_SYSCALLS. It generates
+# trace-event metadata for every syscall, touching the trace_event_call and
+# syscall_metadata structures -- and Qualcomm's vendor modules use tracepoints
+# heavily. It is the only one of the four that plausibly reaches structures
+# the modules themselves also see.
+#
+# By contrast STACK_TRACER only adds kernel/trace/trace_stack.c and registers
+# a function hook; DYNAMIC_FTRACE cannot exist without FUNCTION_TRACER and
+# actually reduces runtime cost. FUNCTION_TRACER itself changes code
+# generation for every function rather than any struct layout, so if "func"
+# also fails to boot, ftrace and a stock vendor_dlkm are simply incompatible
+# here and there is no middle ground left to find.
 #
 # FTRACE_LEVEL:
 #   none  -> touch nothing, keep the vendor config exactly as merged
-#   trace -> function tracing without debugfs  (DEFAULT)
-#   full  -> also CONFIG_DEBUG_FS=y           (known to break boot here)
+#   func  -> FUNCTION_TRACER + DYNAMIC_FTRACE + STACK_TRACER   (DEFAULT)
+#   trace -> func + FTRACE_SYSCALLS          (does not boot on ingres)
+#   full  -> trace + DEBUG_FS                (does not boot on ingres)
 # ---------------------------------------------------------------------------
 enable_ftrace_debug_configs() {
   local config_file="$1"
-  local level="${FTRACE_LEVEL:-trace}"
+  local level="${FTRACE_LEVEL:-func}"
 
   case "$level" in
     none)
       echo "[i] FTRACE_LEVEL=none: leaving the vendor tracing config untouched."
       return 0
       ;;
-    trace|full)
+    func|trace|full)
       ;;
     *)
-      echo "::error::Unknown FTRACE_LEVEL '${level}' (expected none|trace|full)"
+      echo "::error::Unknown FTRACE_LEVEL '${level}' (expected none|func|trace|full)"
       exit 1
       ;;
   esac
@@ -178,17 +191,21 @@ enable_ftrace_debug_configs() {
     CONFIG_GENERIC_TRACER \
     CONFIG_FUNCTION_TRACER \
     CONFIG_DYNAMIC_FTRACE \
-    CONFIG_FTRACE_SYSCALLS \
     CONFIG_STACK_TRACER
+
+  echo "[+] FTRACE_LEVEL=${level}: FUNCTION_TRACER + DYNAMIC_FTRACE + STACK_TRACER"
+  echo "    Tracing interface: /sys/kernel/tracing"
+
+  if [[ "$level" == "trace" || "$level" == "full" ]]; then
+    enable_config_values "$config_file" CONFIG_FTRACE_SYSCALLS
+    echo "[!] + CONFIG_FTRACE_SYSCALLS. This has been observed NOT to boot on"
+    echo "[!] ingres with the stock vendor_dlkm."
+  fi
 
   if [[ "$level" == "full" ]]; then
     enable_config_values "$config_file" CONFIG_DEBUG_FS
-    echo "[!] FTRACE_LEVEL=full: CONFIG_DEBUG_FS forced on, overriding the"
-    echo "[!] vendor's debugfs.config. This configuration has been observed"
-    echo "[!] NOT to boot on ingres. Use 'trace' unless you are testing this."
-  else
-    echo "[+] FTRACE_LEVEL=trace: function tracing on, CONFIG_DEBUG_FS left as"
-    echo "    the vendor set it. Tracing interface: /sys/kernel/tracing"
+    echo "[!] + CONFIG_DEBUG_FS, overriding the vendor's debugfs.config."
+    echo "[!] Also observed NOT to boot on ingres."
   fi
 }
 
