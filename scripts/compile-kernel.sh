@@ -14,7 +14,7 @@
 #   GITHUB_WORKSPACE CLANG_VERSION SOC BUILD_CONFIGS SOURCE_LAYOUT
 #   OFFICIAL_BUILD_TARGET KSU_TYPE KERNEL_BRANCH
 #   SUSFS_REF / SUSFS_PATCH_FILE (susfs variants only)
-#   FTRACE_LEVEL=none|trace|full (default trace; see kernel-helpers.sh)
+#   FTRACE_LEVEL=none|func|trace|full (default func; see kernel-helpers.sh)
 #
 set -euo pipefail
 
@@ -37,7 +37,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${KSU_TYPE:?}"
 : "${KERNEL_BRANCH:?}"
 
-FTRACE_LEVEL="${FTRACE_LEVEL:-trace}"
+FTRACE_LEVEL="${FTRACE_LEVEL:-func}"
 export FTRACE_LEVEL
 
 IS_KPM_BUILD=0
@@ -169,28 +169,28 @@ assert_config_not_y() {
   fi
 }
 
-case "$FTRACE_LEVEL" in
-  trace)
-    assert_config_y CONFIG_FTRACE           "tracers menu switch"
-    assert_config_y CONFIG_FUNCTION_TRACER  "ftrace_level=trace"
-    assert_config_y CONFIG_DYNAMIC_FTRACE   "ftrace_level=trace"
-    assert_config_y CONFIG_FTRACE_SYSCALLS  "ftrace_level=trace"
-    assert_config_y CONFIG_STACK_TRACER     "ftrace_level=trace"
-    # Not asserting DEBUG_FS either way: 'trace' leaves it exactly as the
-    # vendor fragments set it, which on ingres means n.
-    ;;
-  full)
-    assert_config_y CONFIG_FTRACE           "tracers menu switch"
-    assert_config_y CONFIG_FUNCTION_TRACER  "ftrace_level=full"
-    assert_config_y CONFIG_DYNAMIC_FTRACE   "ftrace_level=full"
-    assert_config_y CONFIG_FTRACE_SYSCALLS  "ftrace_level=full"
-    assert_config_y CONFIG_STACK_TRACER     "ftrace_level=full"
-    assert_config_y CONFIG_DEBUG_FS         "ftrace_level=full"
-    ;;
-  none)
-    echo "  [i]    ftrace_level=none; vendor tracing config kept as-is"
-    ;;
-esac
+if [[ "$FTRACE_LEVEL" == "none" ]]; then
+  echo "  [i]    ftrace_level=none; vendor tracing config kept as-is"
+else
+  assert_config_y CONFIG_FTRACE           "tracers menu switch"
+  assert_config_y CONFIG_FUNCTION_TRACER  "ftrace_level=${FTRACE_LEVEL}"
+  assert_config_y CONFIG_DYNAMIC_FTRACE   "ftrace_level=${FTRACE_LEVEL}"
+  assert_config_y CONFIG_STACK_TRACER     "ftrace_level=${FTRACE_LEVEL}"
+
+  # 'func' deliberately leaves these two alone -- they are the options being
+  # bisected out, and DEBUG_FS stays exactly as the vendor fragments set it.
+  if [[ "$FTRACE_LEVEL" == "trace" || "$FTRACE_LEVEL" == "full" ]]; then
+    assert_config_y CONFIG_FTRACE_SYSCALLS "ftrace_level=${FTRACE_LEVEL}"
+  else
+    assert_config_not_y CONFIG_FTRACE_SYSCALLS "ftrace_level=func excludes it (suspected boot breaker)"
+  fi
+
+  if [[ "$FTRACE_LEVEL" == "full" ]]; then
+    assert_config_y CONFIG_DEBUG_FS "ftrace_level=full"
+  else
+    assert_config_not_y CONFIG_DEBUG_FS "only ftrace_level=full overrides the vendor's DEBUG_FS=n"
+  fi
+fi
 
 if [[ "$IS_KSU_BUILD" -eq 1 ]]; then
   assert_config_y CONFIG_KSU "root support was requested"
