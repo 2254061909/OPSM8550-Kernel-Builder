@@ -38,28 +38,7 @@ patch_susfs_kernelsu_layout() {
   fi
 }
 
-# ---------------------------------------------------------------------------
-# The susfs KernelSU patch is cut against an older SukiSU snapshot. Its hunks
-# apply "cleanly" while deleting things that only exist in the newer upstream
-# tree. Two distinct kinds of damage:
-#
-#   1. Deleted #include lines. core/init.c lost "hook/lsm_hook.h" and the
-#      syscall-hook-manager header, so ksu_lsm_hook_init() and
-#      ksu_syscall_hook_manager_*() became implicit declarations.
-#
-#   2. Deleted declarations in headers, e.g. `extern bool ksu_late_loaded;`
-#      from include/ksu.h.
-#
-# Both are restored below. The restore must be keyed on the SYMBOL NAME, not
-# the exact line: the patch legitimately CHANGES some signatures (it makes
-# escape_to_root_for_init() return int, and reshapes
-# ksu_adb_root_handle_execve()). Restoring those by exact-line comparison
-# reintroduces the old prototype next to the new one and yields
-# "conflicting types" errors.
-# ---------------------------------------------------------------------------
-
-# Symbol name from a declaration line: identifier just before '(' for
-# functions, or the last identifier for `extern <type> name;`.
+# Symbol name from a declaration line.
 _decl_symbol_name() {
   local line="$1"
   if [[ "$line" == *"("* ]]; then
@@ -92,7 +71,6 @@ restore_includes_deleted_by_susfs_patch() {
     echo "[+] Restoring ${#to_restore[@]} #include(s) removed from ${file}:"
     printf '      %s\n' "${to_restore[@]}"
 
-    # Insert after the last existing #include so ordering stays sane.
     local last_inc
     last_inc="$(grep -n '^#include' "$abs" | tail -n 1 | cut -d: -f1)"
     if [[ -n "$last_inc" ]]; then
@@ -100,8 +78,6 @@ restore_includes_deleted_by_susfs_patch() {
       printf '%s\n' "${to_restore[@]}" > "$tmp"
       sed -i "${last_inc}r ${tmp}" "$abs"
       rm -f "$tmp"
-    else
-      printf '%s\n' "${to_restore[@]}" | cat - "$abs" > "${abs}.new" && mv "${abs}.new" "$abs"
     fi
     restored=1
   done < <(git -C "$ksu_repo_dir" diff --name-only -- '*.c' '*.h')
@@ -128,8 +104,6 @@ restore_declarations_deleted_from_ksu_headers() {
       local sym
       sym="$(_decl_symbol_name "$line")"
       [[ -z "$sym" ]] && continue
-      # If the symbol is declared at all after patching -- even with a
-      # different signature -- the patch reshaped it on purpose. Leave it.
       grep -qE "\b${sym}\b" "$abs" && continue
 
       to_restore+=("$line")
@@ -162,19 +136,89 @@ restore_declarations_deleted_from_ksu_headers() {
 }
 
 # ---------------------------------------------------------------------------
+# core/init.c ends up calling functions whose prototypes are no longer visible:
+# the susfs patch removed the #include lines that pulled them in, and those
+# includes did not come from a file the patch otherwise modified, so the
+# diff-based restore above cannot see them.
+#
+# Resolve it from the symbol side instead: for every function init.c calls but
+# has no declaration for, locate the header in the KSU tree that declares it and
+# add that #include. If no header declares it, fall back to a local prototype
+# (all of these are void(void) by usage).
+# ---------------------------------------------------------------------------
+ensure_init_symbols_declared() {
+  local ksu_dir="$1"
+  local init_c="${ksu_dir}/core/init.c"
+  [[ -f "$init_c" ]] || return 0
+
+  local sym hdr rel decl_re
+  local added_includes=() added_protos=()
+
+  # Functions called in init.c, in call syntax `name(`, that are KSU's own.
+  local called
+  called="$(grep -oE '\bksu_[A-Za-z0-9_]+\(' "$init_c" | sed 's/($//;s/(//' | sort -u)"
+
+  for sym in $called; do
+    decl_re="^[A-Za-z_][A-Za-z0-9_[:space:]\*]*[[:space:]\*]${sym}[[:space:]]*\("
+
+    # Already declared in a header init.c includes? Cheap approximation:
+    # is it declared in any header that init.c currently includes by name.
+    local visible=0
+    while IFS= read -r rel; do
+      [[ -z "$rel" ]] && continue
+      [[ -f "${ksu_dir}/${rel}" ]] || continue
+      if grep -qE "$decl_re" "${ksu_dir}/${rel}"; then
+        visible=1
+        break
+      fi
+    done < <(grep -oE '^#include[[:space:]]+"[^"]+"' "$init_c" | sed -E 's/.*"([^"]+)".*/\1/')
+    [[ "$visible" -eq 1 ]] && continue
+
+    # Defined right here in init.c? Then no include is needed.
+    grep -qE "$decl_re" "$init_c" && continue
+
+    # Find a header in the tree that declares it.
+    hdr="$(grep -rlE "$decl_re" "$ksu_dir" --include='*.h' 2>/dev/null | head -n 1)"
+
+    if [[ -n "$hdr" ]]; then
+      rel="${hdr#"${ksu_dir}"/}"
+      grep -Fq "#include \"${rel}\"" "$init_c" && continue
+      local last_inc
+      last_inc="$(grep -n '^#include' "$init_c" | tail -n 1 | cut -d: -f1)"
+      sed -i "${last_inc}a #include \"${rel}\"" "$init_c"
+      added_includes+=("${sym} -> ${rel}")
+    else
+      local last_inc
+      last_inc="$(grep -n '^#include' "$init_c" | tail -n 1 | cut -d: -f1)"
+      sed -i "${last_inc}a void ${sym}(void);" "$init_c"
+      added_protos+=("$sym")
+    fi
+  done
+
+  if [[ "${#added_includes[@]}" -gt 0 ]]; then
+    echo "[+] Added ${#added_includes[@]} missing #include(s) to core/init.c:"
+    printf '      %s\n' "${added_includes[@]}"
+  fi
+  if [[ "${#added_protos[@]}" -gt 0 ]]; then
+    echo "[+] Added ${#added_protos[@]} local prototype(s) to core/init.c"
+    echo "    (no header in the tree declares them):"
+    printf '      void %s(void);\n' "${added_protos[@]}"
+  fi
+  if [[ "${#added_includes[@]}" -eq 0 && "${#added_protos[@]}" -eq 0 ]]; then
+    echo "[i] All KSU symbols used by core/init.c already have declarations."
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
 # Known drift hunks that git apply rejects outright:
 #
-#   kernel/Kbuild        #2  deletes the x86 syscall-dispatcher block. No susfs
-#                            content; applying it would break x86. Skipped.
-#   kernel/core/init.c   #3  swaps the current syscall_hook/symbol_resolver
-#                            headers for the older setuid_hook/sucompat ones.
-#                            No susfs content. Skipped.
-#   kernel/core/init.c   #7  rewrites the init sequence for the pre-late-load
-#                            architecture. Its only susfs content is
-#                            susfs_init(), which we inject exactly.
+#   kernel/Kbuild        #2  deletes the x86 syscall-dispatcher block. Skipped.
+#   kernel/core/init.c   #3  swaps hook headers for the older ones. Skipped.
+#   kernel/core/init.c   #7  rewrites the init sequence; its only susfs content
+#                            is susfs_init(), which we inject exactly.
 #   kernel/policy/
-#     app_profile.h      #1  escape_to_root_for_init() void -> int. REQUIRED:
-#                            app_profile.c already patched and returns int.
+#     app_profile.h      #1  escape_to_root_for_init() void -> int. REQUIRED.
 # ---------------------------------------------------------------------------
 resolve_known_susfs_ksu_drift() {
   local ksu_repo_dir="$1"
@@ -182,7 +226,6 @@ resolve_known_susfs_ksu_drift() {
   local init_c="${ksu_dir}/core/init.c"
   local profile_h="${ksu_dir}/policy/app_profile.h"
 
-  # --- 1. init.c: inject susfs_init() ---------------------------------------
   if [[ -f "$init_c" ]]; then
     if grep -q 'susfs_init();' "$init_c"; then
       echo "[+] init.c already calls susfs_init()."
@@ -212,38 +255,22 @@ resolve_known_susfs_ksu_drift() {
     }
   fi
 
-  # --- 2. app_profile.h: prototype must match the patched .c ----------------
   if [[ -f "$profile_h" ]]; then
     sed -i 's/^void escape_to_root_for_init(void);$/int escape_to_root_for_init(void);/' "$profile_h"
 
-    if grep -q '^int escape_to_root_for_init(void);$' "$profile_h"; then
-      echo "[+] app_profile.h: escape_to_root_for_init() prototype now returns int."
-    else
+    grep -q '^int escape_to_root_for_init(void);$' "$profile_h" || {
       echo "::error::Failed to fix the escape_to_root_for_init() prototype in ${profile_h}."
       cat -n "$profile_h"
       exit 1
-    fi
+    }
+    echo "[+] app_profile.h: escape_to_root_for_init() prototype now returns int."
   fi
 
-  # --- 3. put back what the patch's hunks silently removed ------------------
   restore_includes_deleted_by_susfs_patch "$ksu_repo_dir"
   restore_declarations_deleted_from_ksu_headers "$ksu_repo_dir"
-
-  # --- 4. guard against duplicate prototypes we may have reintroduced -------
-  local dup_sym
-  for dup_sym in escape_to_root_for_init ksu_adb_root_handle_execve; do
-    local count
-    count="$(grep -rhcE "^[A-Za-z_].*\b${dup_sym}\b\(" "$ksu_dir" --include='*.h' 2>/dev/null | paste -sd+ | bc 2>/dev/null || echo 0)"
-    if [[ "${count:-0}" -gt 1 ]]; then
-      echo "::error::${dup_sym} is declared ${count} times across KSU headers;"
-      echo "::error::that will fail with 'conflicting types'."
-      grep -rnE "^[A-Za-z_].*\b${dup_sym}\b\(" "$ksu_dir" --include='*.h' || true
-      exit 1
-    fi
-  done
+  ensure_init_symbols_declared "$ksu_dir"
 }
 
-# Reject files we knowingly resolve above. Anything else is a real conflict.
 susfs_reject_is_known() {
   case "$1" in
     */kernel/Kbuild.rej) return 0 ;;
@@ -299,8 +326,7 @@ patch_kernelsu_for_susfs() {
   done < <(find "$ksu_repo_dir" -name '*.rej' | sort)
 
   if [[ "$unexpected" -ne 0 ]]; then
-    echo "::error::susfs KernelSU patch produced rejects we do not know how to"
-    echo "::error::resolve. susfs and SukiSU-Ultra have drifted further apart."
+    echo "::error::susfs KernelSU patch produced rejects we do not know how to resolve."
     exit 1
   fi
 
@@ -446,13 +472,11 @@ apply_susfs_full() {
 
   test -f include/linux/susfs_def.h || {
     echo "::error::susfs_def.h was not copied into include/linux from $susfs_ref"
-    find include/linux -maxdepth 1 -type f -name 'susfs*' -print || true
     exit 1
   }
 
   test -f "${ksu_kernel_dir}/include/linux/susfs_def.h" || {
-    echo "::error::susfs_def.h was not copied into ${ksu_kernel_dir}/include/linux from $susfs_ref"
-    find "${ksu_kernel_dir}/include/linux" -maxdepth 1 -type f -name 'susfs*' -print || true
+    echo "::error::susfs_def.h was not copied into ${ksu_kernel_dir}/include/linux"
     exit 1
   }
 
@@ -469,7 +493,6 @@ apply_susfs_full() {
       echo "[+] Resolved known susfs task_mmu.c patch drift."
     else
       echo "==== PATCH FAILED ===="
-      echo "==== REJECT FILES ===="
       find . -name "*.rej" -print -exec sh -c 'echo "---- $1 ----"; cat "$1"' _ {} \;
       exit 1
     fi
