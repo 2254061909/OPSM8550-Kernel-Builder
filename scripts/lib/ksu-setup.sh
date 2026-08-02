@@ -83,32 +83,8 @@ overlay_kpm_from_sukisu() {
   cp -r SukiSU-Ultra-kpm/kernel/kpm "${ksu_kernel_dir}/kpm"
   echo "[+] Copied kpm/ source files."
 
-  # Append KPM definitions to ReSukiSU's supercall.h (don't overwrite)
-  local sc_h="${ksu_kernel_dir}/include/uapi/supercall.h"
-  if [[ -f "$sc_h" ]] && ! grep -q 'SUKISU_KPM_LOAD' "$sc_h"; then
-    mkdir -p "$(dirname "$sc_h")"
-    cat >> "$sc_h" << 'KPM_DEFS'
-
-/* KPM definitions (overlay from SukiSU-Ultra) */
-static const __u32 SUKISU_KPM_LOAD = 1;
-static const __u32 SUKISU_KPM_UNLOAD = 2;
-static const __u32 SUKISU_KPM_NUM = 3;
-static const __u32 SUKISU_KPM_LIST = 4;
-static const __u32 SUKISU_KPM_INFO = 5;
-static const __u32 SUKISU_KPM_CONTROL = 6;
-static const __u32 SUKISU_KPM_VERSION = 7;
-
-struct ksu_kpm_cmd {
-    __aligned_u64 __user control_code;
-    __aligned_u64 __user arg1;
-    __aligned_u64 __user arg2;
-    __aligned_u64 __user result_code;
-};
-KPM_DEFS
-    echo "[+] Appended KPM definitions to supercall.h."
-  else
-    echo "[+] KPM definitions already in supercall.h, or file not found."
-  fi
+  # ReSukiSU's supercall.h already includes KPM definitions (SUKISU_KPM_*, ksu_kpm_cmd).
+  # No need to overwrite or append anything — kpm.h includes it via include path.
 
   # Fix compact.c: ReSukiSU renamed ksu_manager_appid -> ksu_last_manager_appid
   local compact_c="${ksu_kernel_dir}/kpm/compact.c"
@@ -128,7 +104,7 @@ KPM_DEFS
     echo "[+] KPM objects already present in Kbuild."
   fi
 
-  # Add CONFIG_KPM to Kconfig
+  # Add CONFIG_KPM to Kconfig (ReSukiSU Kconfig lacks it)
   local kconfig="${ksu_kernel_dir}/Kconfig"
   if ! grep -q 'config KPM' "$kconfig"; then
     cat >> "$kconfig" << 'KPM_KCONFIG'
