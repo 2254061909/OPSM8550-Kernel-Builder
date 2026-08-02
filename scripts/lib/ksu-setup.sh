@@ -15,17 +15,47 @@
 #
 # That means the KernelSU-side susfs patch (10_enable_susfs_for_ksu.patch) must
 # NOT be applied on top of it. Only the kernel-tree patch
-# (50_add_susfs_in_gki-*.patch) is needed, exactly as upstream build workflows
-# do it. Applying the KSU-side patch to an already-susfs-aware tree is what
-# produced the endless stream of rejects, deleted includes and deleted
-# declarations.
+# (50_add_susfs_in_gki-*.patch) is needed. Applying the KSU-side patch to an
+# already-susfs-aware tree is what produced the endless stream of rejects,
+# deleted includes and deleted declarations.
 #
 # For reference, the other branches:
-#   main    -> KPM, no susfs in Kconfig (needs the KSU-side patch: painful)
+#   main          -> KPM, no susfs in Kconfig (needs the KSU-side patch: painful)
 #   ReSukiSU main -> native susfs, KPM deliberately removed
 #   susfs-main / susfs-dev / susfs-stable -> deleted upstream
+#
+# SUKISU_KPM_COMMIT pins the exact revision. A branch name alone is a moving
+# target: susfs and SukiSU evolve independently, and a combination that builds
+# and boots today can break tomorrow with no change on our side. This commit is
+# the one verified working on ingres (kernel 5.10.247-gki, susfs v2.2.0, KPM
+# loader active, 388 vendor modules loading cleanly).
+#
+# To move forward deliberately: update the commit, build, flash, verify -- then
+# commit the new value. Set SUKISU_KPM_COMMIT="" to track the branch tip.
 # ---------------------------------------------------------------------------
 SUKISU_KPM_REF="${SUKISU_KPM_REF:-builtin}"
+SUKISU_KPM_COMMIT="${SUKISU_KPM_COMMIT-b1d534bc}"
+
+# Check out an exact commit in an already-cloned shallow repo.
+# Falls back to the branch tip with a loud warning rather than failing the
+# build, since a pin going stale should not be fatal.
+pin_repo_to_commit() {
+  local repo_dir="$1"
+  local commit="$2"
+  local label="$3"
+
+  [[ -z "$commit" ]] && return 0
+
+  if git -C "$repo_dir" fetch --depth=1 origin "$commit" 2>/dev/null \
+     && git -C "$repo_dir" checkout -q FETCH_HEAD 2>/dev/null; then
+    echo "[+] ${label}: pinned to ${commit}"
+  else
+    echo "::warning::${label}: could not check out pinned commit ${commit};"
+    echo "::warning::staying on the branch tip. The build may differ from the"
+    echo "::warning::verified configuration."
+  fi
+  git -C "$repo_dir" log -1 --format='    HEAD: %H (%ci)' 2>/dev/null || true
+}
 
 setup_kernelsu_repo() {
   local owner="$1"
@@ -33,6 +63,7 @@ setup_kernelsu_repo() {
   local requested_ref="$3"
   local allow_fallbacks="${4:-0}"
   local full_history="${5:-0}"
+  local pin_commit="${6:-}"
   local repo_dir="$repo"
   local driver_dir
   local kconfig_source
@@ -76,6 +107,8 @@ setup_kernelsu_repo() {
     echo "::error::Failed to clone ${owner}/${repo} using refs: $refs_to_try"
     exit 1
   fi
+
+  pin_repo_to_commit "$repo_dir" "$pin_commit" "${owner}/${repo}"
 
   rm -rf "$driver_dir/kernelsu"
   ln -sfn "$(realpath --relative-to="$driver_dir" "$repo_dir/kernel")" "$driver_dir/kernelsu"
@@ -135,7 +168,7 @@ verify_kpm_capable_driver() {
 
   if [[ "$failed" -ne 0 ]]; then
     echo "::error::The installed KSU tree cannot satisfy susfs + KPM together."
-    echo "::error::Ref requested: ${SUKISU_KPM_REF}"
+    echo "::error::Ref requested: ${SUKISU_KPM_REF} @ ${SUKISU_KPM_COMMIT:-branch tip}"
     echo "::error::Checked out tree contents:"
     ls -1 "${ksu_kernel_dir}" | head -n 40
     exit 1
@@ -172,8 +205,8 @@ install_ksu_variant() {
       # Clone ourselves instead of piping upstream's setup.sh: setup.sh treats a
       # failed checkout as a warning and silently continues on the default
       # branch, which is how a wrong tree slipped through before.
-      echo "[+] KPM variant: SukiSU-Ultra @ ${SUKISU_KPM_REF} (KPM + native susfs)."
-      setup_kernelsu_repo "SukiSU-Ultra" "SukiSU-Ultra" "$SUKISU_KPM_REF" 0 0
+      echo "[+] KPM variant: SukiSU-Ultra @ ${SUKISU_KPM_REF} pinned to ${SUKISU_KPM_COMMIT:-branch tip}"
+      setup_kernelsu_repo "SukiSU-Ultra" "SukiSU-Ultra" "$SUKISU_KPM_REF" 0 0 "$SUKISU_KPM_COMMIT"
       verify_kpm_capable_driver
       ;;
     *)
