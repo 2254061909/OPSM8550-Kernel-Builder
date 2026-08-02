@@ -8,25 +8,30 @@
 # ---------------------------------------------------------------------------
 # PINNED UPSTREAM REFS
 #
-# As of 2026-08 no single upstream branch provides root + susfs + KPM:
-#   ReSukiSU main       -> root + native susfs, KPM deliberately removed
-#   SukiSU-Ultra main   -> root + KPM, susfs must come from susfs4ksu
-#   susfs-* branches    -> deleted upstream, do not reference them
+# SukiSU-Ultra's `builtin` branch carries BOTH KPM and native susfs support:
+# its kernel/Kconfig has `config KPM` and a full "KernelSU - SUSFS" menu
+# (KSU_SUSFS, SUS_PATH, SUS_MOUNT, SUS_KSTAT, SPOOF_UNAME, OPEN_REDIRECT,
+# SUS_MAP ...), all default y.
 #
-# susfs4ksu's 10_enable_susfs_for_ksu.patch is maintained against the MODERN
-# modular layout (kernel/core/, kernel/policy/, kernel/supercall/, ...), so the
-# KSU tree must be a 4.x-style tree. The old flat v3.1.x tags do NOT work: the
-# patch cannot find a single file and silently no-ops.
+# That means the KernelSU-side susfs patch (10_enable_susfs_for_ksu.patch) must
+# NOT be applied on top of it. Only the kernel-tree patch
+# (50_add_susfs_in_gki-*.patch) is needed, exactly as upstream build workflows
+# do it. Applying the KSU-side patch to an already-susfs-aware tree is what
+# produced the endless stream of rejects, deleted includes and deleted
+# declarations.
+#
+# For reference, the other branches:
+#   main    -> KPM, no susfs in Kconfig (needs the KSU-side patch: painful)
+#   ReSukiSU main -> native susfs, KPM deliberately removed
+#   susfs-main / susfs-dev / susfs-stable -> deleted upstream
 # ---------------------------------------------------------------------------
-SUKISU_KPM_REF="${SUKISU_KPM_REF:-main}"
+SUKISU_KPM_REF="${SUKISU_KPM_REF:-builtin}"
 
 setup_kernelsu_repo() {
   local owner="$1"
   local repo="$2"
   local requested_ref="$3"
   local allow_fallbacks="${4:-0}"
-  # full_history=1 keeps the whole object store so `git apply -3` can do a real
-  # three-way merge against the blobs referenced by a patch's index lines.
   local full_history="${5:-0}"
   local repo_dir="$repo"
   local driver_dir
@@ -84,18 +89,20 @@ setup_kernelsu_next() {
   setup_kernelsu_repo "KernelSU-Next" "KernelSU-Next" "$requested_ref" 1
 }
 
-# The KPM variant needs a tree that has BOTH the KPM sources and the modular
-# layout that susfs4ksu's KernelSU patch targets. Upstream's setup.sh swallows a
-# failed checkout ("|| echo Checkout default branch"), so we clone the ref
-# ourselves and verify the result rather than trusting it.
+# The KPM variant needs a tree with KPM sources AND native susfs support.
+# Upstream's setup.sh swallows a failed checkout ("|| echo Checkout default
+# branch"), so we clone the ref ourselves and verify what we actually got.
+#
+# Note: no layout assertion here. The `builtin` branch is flat (ksu.c at the
+# top level, no core/), which is fine precisely because we never apply the
+# KernelSU-side susfs patch to it.
 verify_kpm_capable_driver() {
-  local driver_dir ksu_kernel_dir ksu_repo_dir failed=0
+  local driver_dir ksu_kernel_dir failed=0
   driver_dir="$(detect_kernelsu_driver_dir)" || {
     echo "::error::drivers directory not found while verifying KPM support"
     exit 1
   }
   ksu_kernel_dir="$(readlink -f "${driver_dir}/kernelsu")"
-  ksu_repo_dir="$(dirname "$ksu_kernel_dir")"
 
   echo "==== KSU TREE VERIFICATION ===="
 
@@ -113,38 +120,28 @@ verify_kpm_capable_driver() {
     failed=1
   fi
 
-  # Modular layout check. susfs4ksu's KernelSU patch addresses
-  # kernel/core/init.c, kernel/policy/, kernel/supercall/ etc. On an old flat
-  # tree (core_hook.c at top level) every hunk is skipped with
-  # "can't find file to patch" and susfs silently never gets enabled.
-  if [[ -f "${ksu_kernel_dir}/core/init.c" ]] && [[ -d "${ksu_kernel_dir}/supercall" ]]; then
-    echo "  [OK]   modular layout (core/init.c, supercall/) -- susfs4ksu patch targets this"
+  # Native susfs support is the whole point of this branch. Without it we would
+  # have to apply the KernelSU-side susfs patch, which does not survive contact
+  # with a modern SukiSU tree.
+  if grep -q 'config KSU_SUSFS' "${ksu_kernel_dir}/Kconfig" 2>/dev/null; then
+    echo "  [OK]   Kconfig has native 'config KSU_SUSFS' (no KSU-side patch needed)"
   else
-    echo "  [FAIL] not a modular tree; susfs4ksu's KernelSU patch will match nothing."
-    echo "         Old flat trees (core_hook.c at top level) are NOT usable."
+    echo "  [FAIL] Kconfig has no KSU_SUSFS entry, so this tree has no native"
+    echo "         susfs support. Applying the KernelSU-side susfs patch to a"
+    echo "         modern SukiSU tree does not work -- pick a branch that has"
+    echo "         susfs built in (currently: builtin)."
     failed=1
-  fi
-
-  # Full history is required for the three-way merge in patch_kernelsu_for_susfs.
-  if [[ -f "${ksu_repo_dir}/.git/shallow" ]]; then
-    echo "  [WARN] shallow clone; attempting to unshallow for three-way merge"
-    git -C "$ksu_repo_dir" fetch --unshallow --tags >/dev/null 2>&1 || \
-      echo "  [WARN] unshallow failed; three-way merge may be unavailable"
-  fi
-  if [[ -f "${ksu_repo_dir}/.git/shallow" ]]; then
-    echo "  [WARN] still shallow"
-  else
-    echo "  [OK]   full git history available for three-way merge"
   fi
 
   if [[ "$failed" -ne 0 ]]; then
     echo "::error::The installed KSU tree cannot satisfy susfs + KPM together."
+    echo "::error::Ref requested: ${SUKISU_KPM_REF}"
     echo "::error::Checked out tree contents:"
     ls -1 "${ksu_kernel_dir}" | head -n 40
     exit 1
   fi
 
-  echo "[+] KSU tree verified: KPM sources + modular layout for susfs."
+  echo "[+] KSU tree verified: KPM sources + native susfs support."
   export KSU_KERNEL_DIR="$ksu_kernel_dir"
 }
 
@@ -175,9 +172,8 @@ install_ksu_variant() {
       # Clone ourselves instead of piping upstream's setup.sh: setup.sh treats a
       # failed checkout as a warning and silently continues on the default
       # branch, which is how a wrong tree slipped through before.
-      # Full history (5th arg) is needed for `git apply -3`.
-      echo "[+] KPM variant: SukiSU-Ultra @ ${SUKISU_KPM_REF} (full history)."
-      setup_kernelsu_repo "SukiSU-Ultra" "SukiSU-Ultra" "$SUKISU_KPM_REF" 0 1
+      echo "[+] KPM variant: SukiSU-Ultra @ ${SUKISU_KPM_REF} (KPM + native susfs)."
+      setup_kernelsu_repo "SukiSU-Ultra" "SukiSU-Ultra" "$SUKISU_KPM_REF" 0 0
       verify_kpm_capable_driver
       ;;
     *)
