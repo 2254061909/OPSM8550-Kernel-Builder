@@ -38,33 +38,14 @@ patch_susfs_kernelsu_layout() {
   fi
 }
 
-# Restore the KSU worktree to pristine HEAD. Essential between patch attempts:
-# a half-applied patch leaves files that are valid to neither side, and the next
-# strategy would then be operating on garbage.
-reset_ksu_tree() {
+# Restore tracked files to pristine HEAD. Deliberately does NOT `git clean`:
+# the patch file itself and the susfs headers we copy in are untracked, and
+# wiping them destroys the inputs for the next step.
+reset_ksu_tracked_files() {
   local ksu_repo_dir="$1"
   git -C "$ksu_repo_dir" checkout -- . 2>/dev/null || true
-  git -C "$ksu_repo_dir" clean -fd 2>/dev/null || true
   find "$ksu_repo_dir" -name '*.rej' -delete 2>/dev/null || true
   find "$ksu_repo_dir" -name '*.orig' -delete 2>/dev/null || true
-}
-
-# Any conflict markers left behind mean the merge did not actually resolve.
-assert_no_conflict_markers() {
-  local dir="$1"
-  local hits
-  hits="$(grep -rlE '^(<<<<<<<|>>>>>>>) ' "$dir" --include='*.c' --include='*.h' 2>/dev/null || true)"
-  if [[ -n "$hits" ]]; then
-    echo "::error::Conflict markers left in the KernelSU tree after merging:"
-    printf '%s\n' "$hits"
-    local f
-    printf '%s\n' "$hits" | while IFS= read -r f; do
-      echo "---------- ${f} ----------"
-      grep -nE -A5 -B5 '^(<<<<<<<|=======|>>>>>>>)' "$f" | head -n 60
-    done
-    return 1
-  fi
-  return 0
 }
 
 patch_kernelsu_for_susfs() {
@@ -89,64 +70,56 @@ patch_kernelsu_for_susfs() {
     exit 1
   }
 
-  # Strategy 1: three-way merge.
+  # `git apply --reject` is the right tool here.
   #
-  # susfs4ksu's patch is cut against whatever SukiSU snapshot the susfs author
-  # had. Plain `patch` matches by context lines only, so on a drifted tree it
-  # applies some hunks, rejects others, and can leave a file that is valid to
-  # neither side (we watched it eat an #include block and the leading "//" of a
-  # comment). `git apply -3` instead reconstructs the patch's base blobs from
-  # the index lines and does a real merge, which is exactly the right tool for
-  # version drift. It also fails atomically.
-  echo "==== Applying susfs KernelSU patch (three-way merge) ===="
-  if git -C "$ksu_repo_dir" apply --3way --whitespace=nowarn "$patch_name" 2>&1; then
-    if assert_no_conflict_markers "$ksu_dir"; then
-      echo "[+] Three-way merge applied cleanly."
-    else
-      echo "::error::Three-way merge produced conflicts that need manual resolution."
-      exit 1
-    fi
-  else
-    echo "[!] Three-way merge failed (missing base blobs or real conflicts)."
-    echo "[!] Resetting the tree and falling back to context matching."
-    reset_ksu_tree "$ksu_repo_dir"
+  # A three-way merge is impossible: the patch's base blobs live in the susfs
+  # author's own fork and are not objects in the SukiSU-Ultra repository, so
+  # --3way always reports "repository lacks the necessary blob" no matter how
+  # deep we clone.
+  #
+  # --reject applies every hunk that fits and writes the rest to .rej, with no
+  # fuzzy context matching and no partial rewrites of the files it cannot
+  # handle. That gives us an exact, minimal list of what actually drifted.
+  echo "==== Applying susfs KernelSU patch (git apply --reject) ===="
+  local apply_rc=0
+  git -C "$ksu_repo_dir" apply --reject --whitespace=nowarn "$patch_name" 2>&1 || apply_rc=$?
 
-    # Strategy 2: context matching, but WITHOUT --forward. We want a hunk to
-    # either apply or be rejected; we do not want a partially rewritten file.
-    local patch_rc=0
-    (
-      cd "$ksu_repo_dir"
-      patch -p1 --batch < "$patch_name"
-    ) || patch_rc=$?
+  local rejects
+  rejects="$(find "$ksu_repo_dir" -name '*.rej' | sort)"
 
-    local rej
-    local blocking=0
-    while IFS= read -r rej; do
+  if [[ -n "$rejects" ]]; then
+    echo "==== FILES THAT DID NOT APPLY ===="
+    local rej target
+    printf '%s\n' "$rejects" | while IFS= read -r rej; do
       [[ -z "$rej" ]] && continue
-      echo "---------- REJECT: ${rej} ----------"
+      target="${rej%.rej}"
+      echo "########## REJECT: ${rej} ##########"
       cat "$rej"
       echo
-      blocking=1
-    done < <(find "$ksu_repo_dir" -name '*.rej' | sort)
-
-    if [[ "$blocking" -ne 0 ]] || [[ "$patch_rc" -ne 0 ]]; then
-      echo "::error::susfs KernelSU patch could not be applied by either strategy."
-      echo "::error::Patch: $patch_file"
-      echo "::error::Tree:  $ksu_repo_dir"
-      echo "::error::The susfs release and the SukiSU-Ultra revision have drifted"
-      echo "::error::apart. Pin SUKISU_KPM_REF to a revision matching this susfs."
-      exit 1
-    fi
+      if [[ -f "$target" ]]; then
+        echo "########## CURRENT ${target} ##########"
+        cat -n "$target"
+        echo
+      fi
+    done
   fi
 
-  # The real gate: susfs must be wired into the KernelSU Kconfig, or nothing
-  # downstream can enable it and susfs would silently be a no-op.
-  grep -q 'KSU_SUSFS' "$kconfig_file" || {
-    echo "::error::Patch finished but KSU_SUSFS is still missing from $kconfig_file"
+  # susfs must end up wired into the KernelSU Kconfig; that is the difference
+  # between "susfs is built in" and "susfs silently does nothing".
+  if ! grep -q 'KSU_SUSFS' "$kconfig_file"; then
+    echo "::error::KSU_SUSFS is missing from $kconfig_file after patching."
+    echo "::error::susfs would be a no-op; refusing to continue."
     exit 1
-  }
+  fi
 
-  echo "[+] susfs is wired into the KernelSU Kconfig."
+  if [[ -n "$rejects" ]]; then
+    echo "::error::susfs KernelSU patch left rejects (see the dumps above)."
+    echo "::error::susfs and SukiSU-Ultra have drifted in these files only;"
+    echo "::error::everything else applied cleanly."
+    exit 1
+  fi
+
+  echo "[+] susfs KernelSU patch applied cleanly; KSU_SUSFS is wired into Kconfig."
 }
 
 patch_resukisu_susfs_runtime_compat() {
@@ -257,7 +230,7 @@ apply_susfs_full() {
   git clone --depth=1 --no-tags -b "$susfs_ref" \
     https://gitlab.com/simonpunk/susfs4ksu.git susfs
 
-  # Record exactly which susfs revision we are building against.
+  # Record exactly which revisions we are combining.
   echo "==== SUSFS SOURCE ===="
   echo "branch: $susfs_ref"
   ( cd susfs && git log -1 --format='commit: %H%ncommit date: %ci' ) || true
