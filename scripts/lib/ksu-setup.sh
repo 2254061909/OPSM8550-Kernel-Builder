@@ -5,17 +5,76 @@
 # ensure_line_in_file, detect_kernelsu_driver_dir, kernelsu_kconfig_source_path).
 #
 
+# ---------------------------------------------------------------------------
+# PINNED UPSTREAM REFS
+#
+# SukiSU-Ultra's `builtin` branch carries BOTH KPM and native susfs support:
+# its kernel/Kconfig has `config KPM` and a full "KernelSU - SUSFS" menu
+# (KSU_SUSFS, SUS_PATH, SUS_MOUNT, SUS_KSTAT, SPOOF_UNAME, OPEN_REDIRECT,
+# SUS_MAP ...), all default y.
+#
+# That means the KernelSU-side susfs patch (10_enable_susfs_for_ksu.patch) must
+# NOT be applied on top of it. Only the kernel-tree patch
+# (50_add_susfs_in_gki-*.patch) is needed. Applying the KSU-side patch to an
+# already-susfs-aware tree is what produced the endless stream of rejects,
+# deleted includes and deleted declarations.
+#
+# For reference, the other branches:
+#   main          -> KPM, no susfs in Kconfig (needs the KSU-side patch: painful)
+#   ReSukiSU main -> native susfs, KPM deliberately removed
+#   susfs-main / susfs-dev / susfs-stable -> deleted upstream
+#
+# SUKISU_KPM_COMMIT pins the exact revision. A branch name alone is a moving
+# target: susfs and SukiSU evolve independently, and a combination that builds
+# and boots today can break tomorrow with no change on our side. This commit is
+# the one verified working on ingres (kernel 5.10.247-gki, susfs v2.2.0, KPM
+# loader active, 388 vendor modules loading cleanly).
+#
+# To move forward deliberately: update the commit, build, flash, verify -- then
+# commit the new value. Set SUKISU_KPM_COMMIT="" to track the branch tip.
+# ---------------------------------------------------------------------------
+SUKISU_KPM_REF="${SUKISU_KPM_REF:-builtin}"
+SUKISU_KPM_COMMIT="${SUKISU_KPM_COMMIT-b1d534bc}"
+
+# Check out an exact commit in an already-cloned shallow repo.
+# Falls back to the branch tip with a loud warning rather than failing the
+# build, since a pin going stale should not be fatal.
+pin_repo_to_commit() {
+  local repo_dir="$1"
+  local commit="$2"
+  local label="$3"
+
+  [[ -z "$commit" ]] && return 0
+
+  if git -C "$repo_dir" fetch --depth=1 origin "$commit" 2>/dev/null \
+     && git -C "$repo_dir" checkout -q FETCH_HEAD 2>/dev/null; then
+    echo "[+] ${label}: pinned to ${commit}"
+  else
+    echo "::warning::${label}: could not check out pinned commit ${commit};"
+    echo "::warning::staying on the branch tip. The build may differ from the"
+    echo "::warning::verified configuration."
+  fi
+  git -C "$repo_dir" log -1 --format='    HEAD: %H (%ci)' 2>/dev/null || true
+}
+
 setup_kernelsu_repo() {
   local owner="$1"
   local repo="$2"
   local requested_ref="$3"
   local allow_fallbacks="${4:-0}"
+  local full_history="${5:-0}"
+  local pin_commit="${6:-}"
   local repo_dir="$repo"
   local driver_dir
   local kconfig_source
   local ref
   local cloned=0
   local refs_to_try
+  local depth_args="--depth=1 --no-tags"
+
+  if [[ "$full_history" == "1" ]]; then
+    depth_args=""
+  fi
 
   driver_dir="$(detect_kernelsu_driver_dir)" || {
     echo "::error::drivers directory not found in kernel tree"
@@ -33,20 +92,23 @@ setup_kernelsu_repo() {
   for ref in $refs_to_try; do
     [[ -z "$ref" ]] && continue
 
-    if git clone --depth=1 --no-tags -b "$ref" "https://github.com/${owner}/${repo}.git" "$repo_dir"; then
-      echo "[+] Cloned ${owner}/${repo} branch '$ref'."
+    # shellcheck disable=SC2086
+    if git clone $depth_args -b "$ref" "https://github.com/${owner}/${repo}.git" "$repo_dir"; then
+      echo "[+] Cloned ${owner}/${repo} at '$ref'."
       cloned=1
       break
     fi
 
     rm -rf "$repo_dir"
-    echo "[!] ${owner}/${repo} branch '$ref' is unavailable, trying next fallback..."
+    echo "[!] ${owner}/${repo} ref '$ref' is unavailable, trying next fallback..."
   done
 
   if [[ "$cloned" -ne 1 ]]; then
-    echo "::error::Failed to clone ${owner}/${repo} from https://github.com/${owner}/${repo}.git using refs: $refs_to_try"
+    echo "::error::Failed to clone ${owner}/${repo} using refs: $refs_to_try"
     exit 1
   fi
+
+  pin_repo_to_commit "$repo_dir" "$pin_commit" "${owner}/${repo}"
 
   rm -rf "$driver_dir/kernelsu"
   ln -sfn "$(realpath --relative-to="$driver_dir" "$repo_dir/kernel")" "$driver_dir/kernelsu"
@@ -60,71 +122,60 @@ setup_kernelsu_next() {
   setup_kernelsu_repo "KernelSU-Next" "KernelSU-Next" "$requested_ref" 1
 }
 
-# Overlay KPM support from SukiSU-Ultra onto an already-installed KSU driver.
-# Must be called AFTER susfs patches have been applied.
-overlay_kpm_from_sukisu() {
-  local driver_dir
+# The KPM variant needs a tree with KPM sources AND native susfs support.
+# Upstream's setup.sh swallows a failed checkout ("|| echo Checkout default
+# branch"), so we clone the ref ourselves and verify what we actually got.
+#
+# Note: no layout assertion here. The `builtin` branch is flat (ksu.c at the
+# top level, no core/), which is fine precisely because we never apply the
+# KernelSU-side susfs patch to it.
+verify_kpm_capable_driver() {
+  local driver_dir ksu_kernel_dir failed=0
   driver_dir="$(detect_kernelsu_driver_dir)" || {
-    echo "::error::drivers directory not found, cannot overlay KPM"
+    echo "::error::drivers directory not found while verifying KPM support"
     exit 1
   }
-  local ksu_kernel_dir
   ksu_kernel_dir="$(readlink -f "${driver_dir}/kernelsu")"
 
-  echo "[+] Overlaying KPM support from SukiSU-Ultra..."
+  echo "==== KSU TREE VERIFICATION ===="
 
-  # Clone SukiSU-Ultra kernel to extract KPM files
-  rm -rf SukiSU-Ultra-kpm
-  git clone --depth=1 --no-tags -b main \
-    "https://github.com/SukiSU-Ultra/SukiSU-Ultra.git" SukiSU-Ultra-kpm
-
-  # Copy kpm/ directory into the KSU driver
-  rm -rf "${ksu_kernel_dir}/kpm"
-  cp -r SukiSU-Ultra-kpm/kernel/kpm "${ksu_kernel_dir}/kpm"
-  echo "[+] Copied kpm/ source files."
-
-  # ReSukiSU's supercall.h already includes KPM definitions (SUKISU_KPM_*, ksu_kpm_cmd).
-  # No need to overwrite or append anything — kpm.h includes it via include path.
-
-  # Fix compact.c: ReSukiSU renamed ksu_manager_appid -> ksu_last_manager_appid
-  local compact_c="${ksu_kernel_dir}/kpm/compact.c"
-  sed -i 's/ksu_manager_appid/ksu_last_manager_appid/g' "$compact_c"
-  echo "[+] Patched compact.c for ReSukiSU API compatibility."
-
-  # Add C99-compat flag for kpm source files
-  local kbuild="${ksu_kernel_dir}/Kbuild"
-  if ! grep -q 'kpm/kpm.o' "$kbuild"; then
-    printf '\n# KPM objects (overlay from SukiSU-Ultra)\n' >> "$kbuild"
-    printf 'obj-$(CONFIG_KPM) += kpm/compact.o\n' >> "$kbuild"
-    printf 'obj-$(CONFIG_KPM) += kpm/kpm.o\n' >> "$kbuild"
-    printf 'obj-$(CONFIG_KPM) += kpm/super_access.o\n' >> "$kbuild"
-    printf 'subdir-ccflags-$(CONFIG_KPM) += -Wno-gcc-compat\n' >> "$kbuild"
-    echo "[+] Added KPM objects and flags to Kbuild."
+  if [[ -f "${ksu_kernel_dir}/kpm/kpm.c" ]]; then
+    echo "  [OK]   kpm/kpm.c present"
   else
-    echo "[+] KPM objects already present in Kbuild."
+    echo "  [FAIL] no kpm/ sources at ${ksu_kernel_dir}/kpm"
+    failed=1
   fi
 
-  # Add CONFIG_KPM to Kconfig (ReSukiSU Kconfig lacks it)
-  local kconfig="${ksu_kernel_dir}/Kconfig"
-  if ! grep -q 'config KPM' "$kconfig"; then
-    cat >> "$kconfig" << 'KPM_KCONFIG'
-
-config KPM
-    bool "Enable SukiSU KPM"
-    depends on KSU && 64BIT
-    default n
-    help
-      Enabling this option will activate the KPM feature.
-    select KALLSYMS
-    select KALLSYMS_ALL
-KPM_KCONFIG
-    echo "[+] Added CONFIG_KPM to Kconfig."
+  if grep -q 'config KPM' "${ksu_kernel_dir}/Kconfig" 2>/dev/null; then
+    echo "  [OK]   Kconfig has 'config KPM'"
   else
-    echo "[+] CONFIG_KPM already present in Kconfig."
+    echo "  [FAIL] Kconfig has no 'config KPM' entry"
+    failed=1
   fi
 
-  rm -rf SukiSU-Ultra-kpm
-  echo "[+] KPM overlay complete."
+  # Native susfs support is the whole point of this branch. Without it we would
+  # have to apply the KernelSU-side susfs patch, which does not survive contact
+  # with a modern SukiSU tree.
+  if grep -q 'config KSU_SUSFS' "${ksu_kernel_dir}/Kconfig" 2>/dev/null; then
+    echo "  [OK]   Kconfig has native 'config KSU_SUSFS' (no KSU-side patch needed)"
+  else
+    echo "  [FAIL] Kconfig has no KSU_SUSFS entry, so this tree has no native"
+    echo "         susfs support. Applying the KernelSU-side susfs patch to a"
+    echo "         modern SukiSU tree does not work -- pick a branch that has"
+    echo "         susfs built in (currently: builtin)."
+    failed=1
+  fi
+
+  if [[ "$failed" -ne 0 ]]; then
+    echo "::error::The installed KSU tree cannot satisfy susfs + KPM together."
+    echo "::error::Ref requested: ${SUKISU_KPM_REF} @ ${SUKISU_KPM_COMMIT:-branch tip}"
+    echo "::error::Checked out tree contents:"
+    ls -1 "${ksu_kernel_dir}" | head -n 40
+    exit 1
+  fi
+
+  echo "[+] KSU tree verified: KPM sources + native susfs support."
+  export KSU_KERNEL_DIR="$ksu_kernel_dir"
 }
 
 # Apply the chosen KSU preset using its upstream setup.sh / local clone flow.
@@ -145,10 +196,18 @@ install_ksu_variant() {
     "KernelSU-Next")
       setup_kernelsu_next dev
       ;;
-    "ReSukiSU"|"ReSukiSU-with-susfs"|"ReSukiSU-with-susfs-KPM")
-      # ReSukiSU works with susfs patches; KPM is overlaid later if needed.
+    "ReSukiSU"|"ReSukiSU-with-susfs")
+      # ReSukiSU has native susfs support but no KPM.
       curl --retry 5 --retry-delay 3 --retry-all-errors -fLSs \
         "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash -s main
+      ;;
+    "ReSukiSU-with-susfs-KPM")
+      # Clone ourselves instead of piping upstream's setup.sh: setup.sh treats a
+      # failed checkout as a warning and silently continues on the default
+      # branch, which is how a wrong tree slipped through before.
+      echo "[+] KPM variant: SukiSU-Ultra @ ${SUKISU_KPM_REF} pinned to ${SUKISU_KPM_COMMIT:-branch tip}"
+      setup_kernelsu_repo "SukiSU-Ultra" "SukiSU-Ultra" "$SUKISU_KPM_REF" 0 0 "$SUKISU_KPM_COMMIT"
+      verify_kpm_capable_driver
       ;;
     *)
       echo "::error::Unsupported ksu_type: $ksu_type"

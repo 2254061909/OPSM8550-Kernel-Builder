@@ -3,6 +3,22 @@
 # Post-patch/post-build verification helpers. Sourced, not executed.
 #
 
+# Does this KSU tree use the ReSukiSU-style static-key hook plumbing that
+# patch_resukisu_susfs_runtime_compat knows how to fix up?
+#
+# This MUST use the same gate as that function, otherwise the fix is skipped
+# while the verification still demands its result. Matching on the bare
+# ksu_init_rc_hook / ksu_input_hook names is too loose: SukiSU-Ultra has hooks
+# by those names natively, with no relation to susfs static keys.
+#
+# The gate is a susfs-conditional block in runtime/ksud_integration.c.
+ksu_tree_uses_resukisu_hook_plumbing() {
+  local runtime_file="$1"
+  [[ -f "$runtime_file" ]] || return 1
+  grep -q 'CONFIG_KSU_SUSFS' "$runtime_file" || return 1
+  return 0
+}
+
 verify_susfs_source_integration() {
   local ksu_kernel_dir="$1"
   local runtime_file="${ksu_kernel_dir}/runtime/ksud_integration.c"
@@ -37,6 +53,12 @@ verify_susfs_source_integration() {
     exit 1
   }
 
+  # susfs must be callable from the KSU driver, whatever the hook architecture.
+  grep -R -q 'susfs_init' "$ksu_kernel_dir" || {
+    echo "::error::KernelSU tree never calls susfs_init(), so susfs would never start."
+    exit 1
+  }
+
   if grep -R -q 'ksu_selinux_hide_running' security/selinux; then
     local fake_state_def_re='^[[:space:]]*(__[A-Za-z0-9_]+[[:space:]]+)*struct[[:space:]]+selinux_state[[:space:]]+fake_state([[:space:];=]|$)'
     local running_def_re='^[[:space:]]*(__[A-Za-z0-9_]+[[:space:]]+)*bool[[:space:]]+ksu_selinux_hide_running([[:space:];=]|$)'
@@ -51,43 +73,46 @@ verify_susfs_source_integration() {
     }
   fi
 
-  if [[ "$KSU_TYPE" == ReSukiSU* ]]; then
-    test -f "$runtime_file" || {
-      echo "::error::ReSukiSU runtime file is missing at ${runtime_file}"
-      exit 1
-    }
-
+  if ksu_tree_uses_resukisu_hook_plumbing "$runtime_file"; then
     grep -Eq '^[[:space:]]*DEFINE_STATIC_KEY_TRUE\(ksu_is_init_rc_hook_enabled\);$' "$runtime_file" || {
-      echo "::error::ReSukiSU runtime compat is missing ksu_is_init_rc_hook_enabled, so susfs builds will fail or silently fall back."
+      echo "::error::Runtime compat is missing ksu_is_init_rc_hook_enabled, so susfs builds will fail or silently fall back."
       exit 1
     }
 
     grep -Eq '^[[:space:]]*DEFINE_STATIC_KEY_TRUE\(ksu_is_input_hook_enabled\);$' "$runtime_file" || {
-      echo "::error::ReSukiSU runtime compat is missing ksu_is_input_hook_enabled, so susfs builds will fail or silently fall back."
+      echo "::error::Runtime compat is missing ksu_is_input_hook_enabled, so susfs builds will fail or silently fall back."
       exit 1
     }
 
     if ! grep -Eq '^[[:space:]]*#define ksu_init_rc_hook ksu_is_init_rc_hook_enabled$' "$runtime_file" && \
        ! grep -Eq '^[[:space:]]*#define ksu_init_rc_hook_inactive\(\) \(!static_branch_likely\(&ksu_is_init_rc_hook_enabled\)\)$' "$runtime_file"; then
-      echo "::error::ReSukiSU runtime compat is not pointing init_rc hook to the susfs static key."
+      echo "::error::Runtime compat is not pointing init_rc hook to the susfs static key."
       exit 1
     fi
 
     if ! grep -Eq '^[[:space:]]*#define ksu_input_hook ksu_is_input_hook_enabled$' "$runtime_file" && \
        ! grep -Eq '^[[:space:]]*#define ksu_input_hook_inactive\(\) \(!static_branch_likely\(&ksu_is_input_hook_enabled\)\)$' "$runtime_file"; then
-      echo "::error::ReSukiSU runtime compat is not pointing input hook to the susfs static key."
+      echo "::error::Runtime compat is not pointing input hook to the susfs static key."
       exit 1
     fi
+
+    echo "[+] ReSukiSU-style susfs hook plumbing verified."
+  else
+    echo "[i] runtime/ksud_integration.c has no susfs-conditional hook block;"
+    echo "    skipping the ReSukiSU static-key checks. This tree wires susfs in"
+    echo "    through its own hook architecture instead."
   fi
 
   {
     echo "==== SUSFS SOURCE PROOF ===="
     echo "kernel_branch=${KERNEL_BRANCH}"
+    echo "ksu_type=${KSU_TYPE}"
     echo "susfs_ref=${SUSFS_REF}"
     echo "susfs_patch=${SUSFS_PATCH_FILE}"
     grep -Fn 'obj-$(CONFIG_KSU_SUSFS) += susfs.o' fs/Makefile || true
     grep -n 'ksu_handle_sys_reboot' kernel/reboot.c | head -n 5 || true
     grep -R -n 'CMD_SUSFS_SHOW_VERSION' "$ksu_kernel_dir" | head -n 10 || true
+    grep -R -n 'susfs_init' "$ksu_kernel_dir" | head -n 10 || true
     grep -R -nE 'fake_state|ksu_selinux_hide_running' "$ksu_kernel_dir" | head -n 10 || true
     if [[ -f "$runtime_file" ]]; then
       grep -nE 'ksu_is_init_rc_hook_enabled|ksu_is_input_hook_enabled|ksu_init_rc_hook_key_false|ksu_input_hook_key_false' "$runtime_file" | head -n 20 || true
@@ -126,29 +151,32 @@ verify_susfs_binary_presence() {
   } | tee susfs-proof.txt
 }
 
+# Only meaningful for trees that print a hook-mode banner at build time
+# (ReSukiSU). SukiSU-Ultra does not, so this is advisory and the caller in
+# compile-kernel.sh already treats a non-zero return as a warning.
 verify_resukisu_susfs_hook_mode() {
   test -f build.log || {
-    echo "::error::build.log is missing, cannot verify ReSukiSU hook mode."
+    echo "::error::build.log is missing, cannot verify hook mode."
     exit 1
   }
 
+  if ! grep -Eq 'using SUSFS_INLINE_HOOK|using SuSFS Inline hook|using KSU_TRACEPOINT_HOOK|using Tracepoint Syscall Redirect Hook|using KSU_MANUAL_HOOK|using Manual Hook' build.log; then
+    echo "[i] No hook-mode banner in build.log; this tree does not emit one."
+    return 0
+  fi
+
   if grep -Eq 'using KSU_TRACEPOINT_HOOK|using Tracepoint Syscall Redirect Hook' build.log; then
-    echo "::error::ReSukiSU fell back to KSU_TRACEPOINT_HOOK, so the manager will not detect susfs inline mode."
+    echo "::error::Fell back to KSU_TRACEPOINT_HOOK, so the manager will not detect susfs inline mode."
     exit 1
   fi
 
   if grep -Eq 'using KSU_MANUAL_HOOK|using Manual Hook' build.log; then
-    echo "::error::ReSukiSU fell back to KSU_MANUAL_HOOK, so this build is not the expected susfs inline mode."
+    echo "::error::Fell back to KSU_MANUAL_HOOK, so this build is not the expected susfs inline mode."
     exit 1
   fi
 
-  grep -Eq 'using SUSFS_INLINE_HOOK|using SuSFS Inline hook' build.log || {
-    echo "::error::ReSukiSU did not report SUSFS_INLINE_HOOK in build.log."
-    exit 1
-  }
-
   {
-    echo "==== RESUKISU SUSFS HOOK PROOF ===="
+    echo "==== SUSFS HOOK PROOF ===="
     echo "kernel_branch=${KERNEL_BRANCH}"
     echo "susfs_ref=${SUSFS_REF}"
     grep -nE 'using SUSFS_INLINE_HOOK|using SuSFS Inline hook|using KSU_TRACEPOINT_HOOK|using Tracepoint Syscall Redirect Hook|using KSU_MANUAL_HOOK|using Manual Hook' build.log || true

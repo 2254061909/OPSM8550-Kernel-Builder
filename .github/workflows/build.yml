@@ -66,6 +66,18 @@ on:
           - ReSukiSU + susfs
           - ReSukiSU + susfs + KPM
           - ReSukiSU + susfs (build both: with KPM and without KPM)
+      ftrace_level:
+        description: >-
+          trace = function tracing at /sys/kernel/tracing, vendor DEBUG_FS kept
+          (default). full = also force CONFIG_DEBUG_FS=y, known NOT to boot on
+          ingres. none = leave the vendor tracing config untouched.
+        required: true
+        type: choice
+        default: trace
+        options:
+          - trace
+          - none
+          - full
 
 jobs:
   prepare:
@@ -95,7 +107,7 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.prepare.outputs.build_matrix) }}
     concurrency:
-      group: kernel-ci-${{ github.workflow }}-${{ github.ref_name }}-${{ inputs.platform }}-${{ inputs.source_choice }}-${{ inputs.branch_mode }}-${{ inputs.kernel_branch }}-${{ matrix.ksu_type }}-${{ inputs.clang_choice }}
+      group: kernel-ci-${{ github.workflow }}-${{ github.ref_name }}-${{ inputs.platform }}-${{ inputs.source_choice }}-${{ inputs.branch_mode }}-${{ inputs.kernel_branch }}-${{ matrix.ksu_type }}-${{ inputs.clang_choice }}-${{ inputs.ftrace_level }}
       cancel-in-progress: true
 
     permissions:
@@ -156,6 +168,7 @@ jobs:
             ccache \
             dwarves \
             cpio \
+            xxd \
             gcc-aarch64-linux-gnu \
             zip
 
@@ -220,6 +233,8 @@ jobs:
         run: bash scripts/clone-sources.sh
 
       - name: Compile kernel
+        env:
+          FTRACE_LEVEL: ${{ inputs.ftrace_level }}
         run: bash "${GITHUB_WORKSPACE}/scripts/compile-kernel.sh"
 
       - name: Make AnyKernel3 zip
@@ -242,10 +257,11 @@ jobs:
             "$ZIP_FILE" \
             "$IMAGE_FILE"
 
-      - name: Publish susfs diagnostics
-        if: always()
-        run: bash scripts/publish-diagnostics.sh
-
+      # Only what is actually needed to flash:
+      #   Image            -> the kernel to put into boot.img (KPM-patched)
+      #   Image.unpatched  -> same kernel without the KPM patch, the fallback
+      #   *.zip            -> AnyKernel3 flashable package
+      # build.log is kept because a failed build is unreadable without it.
       - name: Upload build artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -253,13 +269,10 @@ jobs:
           name: build-${{ steps.resolve.outputs.soc }}-${{ steps.resolve.outputs.source_slug }}-${{ steps.resolve.outputs.ksu_type }}-${{ env.BUILD_TIMESTAMP }}
           if-no-files-found: ignore
           path: |
-            ${{ github.workspace }}/${{ steps.resolve.outputs.soc }}/build.log
-            ${{ github.workspace }}/${{ steps.resolve.outputs.soc }}/susfs-source-proof.txt
-            ${{ github.workspace }}/${{ steps.resolve.outputs.soc }}/susfs-hook-proof.txt
-            ${{ github.workspace }}/${{ steps.resolve.outputs.soc }}/susfs-proof.txt
-            ${{ github.workspace }}/${{ steps.resolve.outputs.soc }}/out/.config
             ${{ github.workspace }}/${{ steps.resolve.outputs.soc }}/out/arch/arm64/boot/Image
+            ${{ github.workspace }}/${{ steps.resolve.outputs.soc }}/out/arch/arm64/boot/Image.unpatched
             ${{ github.workspace }}/${{ env.ZIP_NAME }}.zip
+            ${{ github.workspace }}/${{ steps.resolve.outputs.soc }}/build.log
 
       - name: Save ccache
         if: always() && steps.ccache-restore.outputs.cache-primary-key != '' && hashFiles('.ccache/**') != ''

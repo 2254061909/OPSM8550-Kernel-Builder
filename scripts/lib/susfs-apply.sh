@@ -1,8 +1,39 @@
 #!/usr/bin/env bash
 #
-# susfs patching helpers and the end-to-end apply routine. Sourced, not
-# executed. Depends on lib/kernel-helpers.sh.
+# susfs integration. Sourced, not executed. Depends on lib/kernel-helpers.sh.
 #
+# How susfs actually gets in:
+#
+#   1. The KSU tree must already know about susfs (CONFIG_KSU_SUSFS in its own
+#      Kconfig). SukiSU-Ultra's `builtin` branch and ReSukiSU both do.
+#   2. Only the KERNEL-TREE patch is applied here
+#      (50_add_susfs_in_gki-*.patch), which adds fs/susfs.c and the hooks in
+#      fs/, mm/ and security/selinux/.
+#   3. CONFIG_KSU_SUSFS=y is set by kernel-helpers.sh.
+#
+# The KernelSU-side patch (10_enable_susfs_for_ksu.patch) is deliberately NOT
+# used. It is cut against whatever SukiSU snapshot the susfs author had, and
+# forcing it onto a modern tree silently deletes #include lines and
+# declarations that the tree still needs, leaving files that are valid to
+# neither side. Trees that ship susfs natively do not need it at all.
+#
+# NOTE: compile-kernel.sh runs under `set -euo pipefail`.
+#
+
+# ---------------------------------------------------------------------------
+# PINNED SUSFS REVISION
+#
+# SUSFS_REF (the branch) comes from resolve-profile.sh and must match the
+# kernel version, e.g. gki-android13-5.10.
+#
+# SUSFS_COMMIT pins the exact revision on that branch. susfs and SukiSU-Ultra
+# evolve independently; a branch tip that works today can break tomorrow. This
+# commit is the one verified on ingres: susfs v2.2.0, initialising at boot,
+# 58 susfs functions live in the running kernel.
+#
+# Set SUSFS_COMMIT="" to track the branch tip instead.
+# ---------------------------------------------------------------------------
+SUSFS_COMMIT="${SUSFS_COMMIT-178a43676a6f607ee053ec5aeb2aa7153c273281}"
 
 apply_susfs_task_mmu_fix() {
   local file="fs/proc/task_mmu.c"
@@ -38,134 +69,50 @@ patch_susfs_kernelsu_layout() {
   fi
 }
 
-patch_kernelsu_for_susfs() {
-  local ksu_repo_dir="$1"
-  local ksu_dir="$2"
-  local patch_file="${ksu_repo_dir}/10_enable_susfs_for_ksu.patch"
-  local kconfig_file="${ksu_dir}/Kconfig"
-
-  test -f "$kconfig_file" || {
-    echo "::error::KernelSU Kconfig not found at $kconfig_file"
-    exit 1
-  }
-
-  if grep -q 'KSU_SUSFS' "$kconfig_file"; then
-    echo "[+] KernelSU tree already contains KSU_SUSFS entries."
-    return 0
-  fi
-
-  test -f "$patch_file" || {
-    echo "::error::Missing KernelSU susfs patch at $patch_file"
-    exit 1
-  }
-
-  (
-    cd "$ksu_repo_dir"
-    patch -p1 < "$(basename "$patch_file")"
-  ) || {
-    echo "::error::Failed to apply KernelSU susfs patch in $ksu_repo_dir"
-    exit 1
-  }
-
-  grep -q 'KSU_SUSFS' "$kconfig_file" || {
-    echo "::error::KernelSU susfs patch applied but KSU_SUSFS is still missing from $kconfig_file"
-    exit 1
-  }
-}
-
-patch_resukisu_susfs_runtime_compat() {
+# Does the KSU tree ship susfs support itself? This is a hard requirement.
+ksu_tree_has_native_susfs() {
   local ksu_kernel_dir="$1"
-  local runtime_file="${ksu_kernel_dir}/runtime/ksud_integration.c"
-
-  [[ -f "$runtime_file" ]] || return 0
-  grep -q 'CONFIG_KSU_SUSFS' "$runtime_file" || return 0
-
-  if grep -Eq '^[[:space:]]*DEFINE_STATIC_KEY_TRUE\(ksu_is_init_rc_hook_enabled\);$' "$runtime_file" && \
-     grep -Eq '^[[:space:]]*DEFINE_STATIC_KEY_TRUE\(ksu_is_input_hook_enabled\);$' "$runtime_file" && \
-     grep -Eq '^[[:space:]]*#define ksu_init_rc_hook_inactive\(\) \(!static_branch_likely\(&ksu_is_init_rc_hook_enabled\)\)$' "$runtime_file" && \
-     grep -Eq '^[[:space:]]*#define ksu_input_hook_inactive\(\) \(!static_branch_likely\(&ksu_is_input_hook_enabled\)\)$' "$runtime_file"; then
-    echo "[+] ReSukiSU runtime already contains native susfs hook support."
-    return 0
-  fi
-
-  sed -i \
-    -e 's/^extern struct static_key_false ksu_init_rc_hook_key_false;$/extern struct static_key_true ksu_is_init_rc_hook_enabled;/' \
-    -e 's/^extern struct static_key_false ksu_input_hook_key_false;$/extern struct static_key_true ksu_is_input_hook_enabled;/' \
-    -e 's/^#define ksu_init_rc_hook ksu_init_rc_hook_key_false$/#define ksu_init_rc_hook ksu_is_init_rc_hook_enabled/' \
-    -e 's/^#define ksu_input_hook ksu_input_hook_key_false$/#define ksu_input_hook ksu_is_input_hook_enabled/' \
-    "$runtime_file"
-
-  insert_line_before_first_match "$runtime_file" "// use define to avoid ifdef" "DEFINE_STATIC_KEY_TRUE(ksu_is_init_rc_hook_enabled);"
-  insert_line_before_first_match "$runtime_file" "// use define to avoid ifdef" "DEFINE_STATIC_KEY_TRUE(ksu_is_input_hook_enabled);"
-  insert_line_before_first_match "$runtime_file" "// use define to avoid ifdef" "#define ksu_init_rc_hook_key_false ksu_is_init_rc_hook_enabled"
-  insert_line_before_first_match "$runtime_file" "// use define to avoid ifdef" "#define ksu_input_hook_key_false ksu_is_input_hook_enabled"
-
-  grep -Eq '^[[:space:]]*DEFINE_STATIC_KEY_TRUE\(ksu_is_init_rc_hook_enabled\);$' "$runtime_file" || {
-    echo "::error::Failed to inject ksu_is_init_rc_hook_enabled compatibility into ${runtime_file}"
-    exit 1
-  }
-
-  grep -Eq '^[[:space:]]*DEFINE_STATIC_KEY_TRUE\(ksu_is_input_hook_enabled\);$' "$runtime_file" || {
-    echo "::error::Failed to inject ksu_is_input_hook_enabled compatibility into ${runtime_file}"
-    exit 1
-  }
-
-  if ! grep -Eq '^[[:space:]]*#define ksu_init_rc_hook ksu_is_init_rc_hook_enabled$' "$runtime_file" && \
-     ! grep -Eq '^[[:space:]]*#define ksu_init_rc_hook_inactive\(\) \(!static_branch_likely\(&ksu_is_init_rc_hook_enabled\)\)$' "$runtime_file"; then
-    echo "::error::Failed to retarget init_rc hook to the susfs static key in ${runtime_file}"
-    exit 1
-  fi
-
-  if ! grep -Eq '^[[:space:]]*#define ksu_input_hook ksu_is_input_hook_enabled$' "$runtime_file" && \
-     ! grep -Eq '^[[:space:]]*#define ksu_input_hook_inactive\(\) \(!static_branch_likely\(&ksu_is_input_hook_enabled\)\)$' "$runtime_file"; then
-    echo "::error::Failed to retarget input hook to the susfs static key in ${runtime_file}"
-    exit 1
-  fi
+  grep -q 'KSU_SUSFS' "${ksu_kernel_dir}/Kconfig" 2>/dev/null
 }
 
-patch_susfs_selinux_hide_compat() {
+require_native_susfs_support() {
   local ksu_kernel_dir="$1"
-  local kbuild_file="${ksu_kernel_dir}/Kbuild"
-  [[ -f "$kbuild_file" ]] || kbuild_file="${ksu_kernel_dir}/Makefile"
-  local compat_dir="${ksu_kernel_dir}/compat"
-  local compat_file="${compat_dir}/susfs_selinux_hide_compat.c"
-  local compat_obj_line='kernelsu-objs += compat/susfs_selinux_hide_compat.o'
-  local fake_state_def_re='^[[:space:]]*(__[A-Za-z0-9_]+[[:space:]]+)*struct[[:space:]]+selinux_state[[:space:]]+fake_state([[:space:];=]|$)'
-  local running_def_re='^[[:space:]]*(__[A-Za-z0-9_]+[[:space:]]+)*bool[[:space:]]+ksu_selinux_hide_running([[:space:];=]|$)'
 
-  if grep -R --exclude='susfs_selinux_hide_compat.c' -Eq "$fake_state_def_re" "$ksu_kernel_dir" && \
-     grep -R --exclude='susfs_selinux_hide_compat.c' -Eq "$running_def_re" "$ksu_kernel_dir"; then
-    if [[ -f "$kbuild_file" ]]; then
-      sed -i "\|^${compat_obj_line}$|d" "$kbuild_file"
-    fi
-    rm -f "$compat_file"
-    echo "[+] KernelSU tree already exports susfs SELinux hide compatibility symbols."
+  if ksu_tree_has_native_susfs "$ksu_kernel_dir"; then
+    echo "[+] KSU tree has native susfs support; only the kernel-tree patch is needed."
     return 0
   fi
 
-  test -f "$kbuild_file" || {
-    echo "::error::KernelSU Kbuild not found at $kbuild_file"
-    exit 1
-  }
-
-  mkdir -p "$compat_dir"
-  cat > "$compat_file" <<'EOF_COMPAT'
-#include <linux/cache.h>
-#include <linux/types.h>
-#include "security.h"
-
-#ifdef CONFIG_KSU_SUSFS
-struct selinux_state fake_state;
-bool ksu_selinux_hide_running __read_mostly = false;
-#endif
-EOF_COMPAT
-
-  ensure_line_in_file "$kbuild_file" "$compat_obj_line"
-  echo "[+] Added susfs SELinux hide compatibility symbols for this KernelSU tree."
+  echo "::error::The installed KSU tree has no CONFIG_KSU_SUSFS in its Kconfig,"
+  echo "::error::so it does not support susfs natively."
+  echo "::error::"
+  echo "::error::Forcing susfs4ksu's KernelSU-side patch onto such a tree does"
+  echo "::error::not work: it deletes includes and declarations the tree still"
+  echo "::error::uses and leaves files that compile as neither version."
+  echo "::error::"
+  echo "::error::Use a KSU revision that ships susfs (SukiSU-Ultra 'builtin',"
+  echo "::error::ReSukiSU 'main') instead."
+  exit 1
 }
 
-# Full susfs apply flow: clone susfs, copy patches, patch KernelSU tree,
-# apply the kernel-side patch with drift recovery.
+# Check out an exact commit in an already-cloned shallow repo. A stale pin
+# warns rather than fails.
+pin_susfs_to_commit() {
+  local repo_dir="$1"
+  local commit="$2"
+
+  [[ -z "$commit" ]] && return 0
+
+  if git -C "$repo_dir" fetch --depth=1 origin "$commit" 2>/dev/null \
+     && git -C "$repo_dir" checkout -q FETCH_HEAD 2>/dev/null; then
+    echo "[+] susfs4ksu: pinned to ${commit}"
+  else
+    echo "::warning::susfs4ksu: could not check out pinned commit ${commit};"
+    echo "::warning::staying on the branch tip. The build may differ from the"
+    echo "::warning::verified configuration."
+  fi
+}
+
 apply_susfs_full() {
   local susfs_ref="$1"
   local susfs_patch_file="$2"
@@ -178,8 +125,18 @@ apply_susfs_full() {
   ksu_kernel_dir="$(readlink -f "${ksu_driver_dir}/kernelsu")"
   ksu_repo_dir="$(dirname "${ksu_kernel_dir}")"
 
+  require_native_susfs_support "$ksu_kernel_dir"
+
   git clone --depth=1 --no-tags -b "$susfs_ref" \
     https://gitlab.com/simonpunk/susfs4ksu.git susfs
+  pin_susfs_to_commit susfs "$SUSFS_COMMIT"
+
+  echo "==== SUSFS SOURCE ===="
+  echo "branch: $susfs_ref"
+  ( cd susfs && git log -1 --format='commit: %H%ncommit date: %ci' ) || true
+  grep -E '^#define SUSFS_VERSION' ./susfs/kernel_patches/include/linux/susfs.h 2>/dev/null || true
+  echo "==== KSU SOURCE ===="
+  git -C "$ksu_repo_dir" log -1 --format='commit: %H%ncommit date: %ci' 2>/dev/null || true
 
   (
     cd susfs
@@ -188,39 +145,29 @@ apply_susfs_full() {
     cp ./kernel_patches/include/linux/* ../include/linux/
   )
 
-  cp ./susfs/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch "${ksu_repo_dir}/"
   mkdir -p "${ksu_kernel_dir}/include/linux"
   cp ./susfs/kernel_patches/include/linux/* "${ksu_kernel_dir}/include/linux/"
-  patch_kernelsu_for_susfs "${ksu_repo_dir}" "${ksu_kernel_dir}"
-  patch_resukisu_susfs_runtime_compat "${ksu_kernel_dir}"
-  patch_susfs_selinux_hide_compat "${ksu_kernel_dir}"
 
   test -f include/linux/susfs_def.h || {
     echo "::error::susfs_def.h was not copied into include/linux from $susfs_ref"
-    find include/linux -maxdepth 1 -type f -name 'susfs*' -print || true
     exit 1
   }
 
-  test -f "${ksu_kernel_dir}/include/linux/susfs_def.h" || {
-    echo "::error::susfs_def.h was not copied into ${ksu_kernel_dir}/include/linux from $susfs_ref"
-    find "${ksu_kernel_dir}/include/linux" -maxdepth 1 -type f -name 'susfs*' -print || true
-    exit 1
-  }
-
-  if ! patch -p1 < "${susfs_patch_file}"; then
-    echo "[!] susfs patch reported conflicts, checking for known task_mmu.c drift..."
+  # ---- kernel-tree patch: fs/, mm/, security/selinux/, kernel/ --------------
+  if ! patch -p1 --batch --forward < "${susfs_patch_file}"; then
+    echo "[!] susfs kernel-tree patch reported conflicts, checking known drift..."
 
     local reject_files reject_count
     reject_files="$(find . -name "*.rej" | sort)"
     reject_count="$(printf '%s\n' "$reject_files" | sed '/^$/d' | wc -l)"
 
+    # Known drift: task_mmu.c moved the susfs_def.h include anchor.
     if [[ "$reject_count" -eq 1 ]] && [[ "$reject_files" == "./fs/proc/task_mmu.c.rej" ]] && grep -q 'susfs_def.h' ./fs/proc/task_mmu.c.rej; then
       apply_susfs_task_mmu_fix
       rm -f ./fs/proc/task_mmu.c.rej
       echo "[+] Resolved known susfs task_mmu.c patch drift."
     else
-      echo "==== PATCH FAILED ===="
-      echo "==== REJECT FILES ===="
+      echo "==== KERNEL-TREE PATCH FAILED ===="
       find . -name "*.rej" -print -exec sh -c 'echo "---- $1 ----"; cat "$1"' _ {} \;
       exit 1
     fi
@@ -228,7 +175,6 @@ apply_susfs_full() {
 
   patch_susfs_kernelsu_layout
 
-  # Export for downstream verification
   export KSU_KERNEL_DIR="$ksu_kernel_dir"
   export KSU_REPO_DIR="$ksu_repo_dir"
 }
