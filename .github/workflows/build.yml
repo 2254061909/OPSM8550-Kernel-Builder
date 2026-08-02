@@ -1,6 +1,6 @@
 name: Build OnePlus Kernel
 run-name: >-
-  ${{ inputs.platform }} | ${{ inputs.source_choice }} | ${{ inputs.root_solution }}
+  ${{ inputs.platform }} | ${{ inputs.source_choice }} | ${{ inputs.root_solution }} | ftrace=${{ inputs.ftrace_level }}
 
 on:
   workflow_dispatch:
@@ -68,15 +68,17 @@ on:
           - ReSukiSU + susfs (build both: with KPM and without KPM)
       ftrace_level:
         description: >-
-          trace = function tracing at /sys/kernel/tracing, vendor DEBUG_FS kept
-          (default). full = also force CONFIG_DEBUG_FS=y, known NOT to boot on
-          ingres. none = leave the vendor tracing config untouched.
+          func = FUNCTION_TRACER + DYNAMIC_FTRACE + STACK_TRACER (default,
+          untested on device). none = vendor config untouched, known to boot.
+          trace = func + FTRACE_SYSCALLS, does NOT boot on ingres. full =
+          trace + DEBUG_FS, does NOT boot on ingres.
         required: true
         type: choice
-        default: trace
+        default: func
         options:
-          - trace
+          - func
           - none
+          - trace
           - full
 
 jobs:
@@ -240,23 +242,6 @@ jobs:
       - name: Make AnyKernel3 zip
         run: bash scripts/make-anykernel-zip.sh
 
-      - name: Create GitHub Release
-        continue-on-error: true
-        run: |
-          set -euo pipefail
-          REL_NAME="${SOC}_${SOURCE_SLUG}-${SAFE_KERNEL_BRANCH}_${KSU_TYPE}_${BUILD_TIMESTAMP}"
-          ZIP_FILE="${GITHUB_WORKSPACE}/${ZIP_NAME}.zip"
-          IMAGE_FILE="${GITHUB_WORKSPACE}/${SOC}/out/arch/arm64/boot/Image"
-
-          test -f "${ZIP_FILE}"
-          test -f "${IMAGE_FILE}"
-
-          gh release create "$REL_NAME" \
-            --title "$REL_NAME" \
-            --notes "" \
-            "$ZIP_FILE" \
-            "$IMAGE_FILE"
-
       # Only what is actually needed to flash:
       #   Image            -> the kernel to put into boot.img (KPM-patched)
       #   Image.unpatched  -> same kernel without the KPM patch, the fallback
@@ -266,7 +251,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: build-${{ steps.resolve.outputs.soc }}-${{ steps.resolve.outputs.source_slug }}-${{ steps.resolve.outputs.ksu_type }}-${{ env.BUILD_TIMESTAMP }}
+          name: build-${{ steps.resolve.outputs.soc }}-${{ steps.resolve.outputs.ksu_type }}-ftrace_${{ inputs.ftrace_level }}-${{ env.BUILD_TIMESTAMP }}
           if-no-files-found: ignore
           path: |
             ${{ github.workspace }}/${{ steps.resolve.outputs.soc }}/out/arch/arm64/boot/Image
