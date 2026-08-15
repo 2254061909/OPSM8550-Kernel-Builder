@@ -25,6 +25,15 @@ case "$INPUT_PLATFORM" in
     OFFICIAL_GKI_FRAGMENT="arch/arm64/configs/vendor/ingres_GKI.config"
     RECOMMENDED_SOURCE="IngresCentre"
     ;;
+  "Xiaomi ingres + CoreSight ETM (SM8450 / custom fork)")
+    SOC="sm8450"
+    PLATFORM_SLUG="ingres"
+    PLATFORM_NAME="Xiaomi ingres + CoreSight ETM (SM8450)"
+    BUILD_CONFIGS="vendor/waipio_GKI.config vendor/xiaomi_GKI.config vendor/ingres_GKI.config vendor/debugfs.config"
+    OFFICIAL_BUILD_TARGET="waipio"
+    OFFICIAL_GKI_FRAGMENT="arch/arm64/configs/vendor/ingres_GKI.config"
+    RECOMMENDED_SOURCE="IngresCentre"
+    ;;
   "Snapdragon 8 Gen 1 (SM8450 / OnePlus 10T / Ace Pro)")
     SOC="sm8450"
     PLATFORM_SLUG="8gen1"
@@ -109,20 +118,20 @@ case "$KERNEL_SOURCE" in
   "OnePlusOSS")             SOURCE_NAME="OnePlus official source";       SOURCE_SLUG="oneplus-official" ;;
   "LineageOS")              SOURCE_NAME="LineageOS";                     SOURCE_SLUG="lineageos" ;;
   "lineage-ovaltine-dev")   SOURCE_NAME="LineageOS community (ovaltine)"; SOURCE_SLUG="lineage-community" ;;
-  "crdroidandroid")         SOURCE_NAME="crDroid";                       SOURCE_SLUG="crdroid" ;;
+  "crdroidandroid")        SOURCE_NAME="crDroid";                       SOURCE_SLUG="crdroid" ;;
   "OnePlus12R-development") SOURCE_NAME="OnePlus 12R development";       SOURCE_SLUG="oneplus12r-dev" ;;
 esac
 fi
 
 # ---- Clang preset ------------------------------------------------------------
 case "$INPUT_CLANG_CHOICE" in
-  "Recommended (auto-select based on branch)")               CLANG_VERSION="" ;;
-  "clang-r563880c (Android 16 / LineageOS 23.2+ era)")       CLANG_VERSION="clang-r563880c" ;;
-  "clang-r547379 (Android 16 / LineageOS 23.0 era)")         CLANG_VERSION="clang-r547379" ;;
-  "clang-r536225 (Android 15 / LineageOS 22.2 era)")         CLANG_VERSION="clang-r536225" ;;
-  "clang-r487747c (Android 14 / LineageOS 21 era)")          CLANG_VERSION="clang-r487747c" ;;
-  "clang-r450784d (Android 13 / LineageOS 20 era)")          CLANG_VERSION="clang-r450784d" ;;
-  "clang-r416183b1 (Android 12 / LineageOS 19.1 era)")       CLANG_VERSION="clang-r416183b1" ;;
+  "Recommended (auto-select based on branch)"               CLANG_VERSION="" ;;
+  "clang-r563880c (Android 16 / LineageOS 23.2+ era)"       CLANG_VERSION="clang-r563880c" ;;
+  "clang-r547379 (Android 16 / LineageOS 23.0 era)"         CLANG_VERSION="clang-r547379" ;;
+  "clang-r536225 (Android 15 / LineageOS 22.2 era)"         CLANG_VERSION="clang-r536225" ;;
+  "clang-r487747c (Android 14 / LineageOS 21 era)"          CLANG_VERSION="clang-r487747c" ;;
+  "clang-r450784d (Android 13 / LineageOS 20 era)"          CLANG_VERSION="clang-r450784d" ;;
+  "clang-r416183b1 (Android 12 / LineageOS 19.1 era)"       CLANG_VERSION="clang-r416183b1" ;;
   *)
     echo "::error::Unknown clang choice: $INPUT_CLANG_CHOICE"
     exit 1
@@ -135,7 +144,14 @@ SUSFS_PATCH_FILE=""
 
 # ---- Repo layout -------------------------------------------------------------
 if [[ "$SOURCE_LAYOUT" == "ingres-flat" ]]; then
-  KERNEL_REPO="https://github.com/Ingres-Centre/android_kernel_xiaomi_sm8450.git"
+  # Check if this is the CoreSight ETM variant and point to the custom fork
+  if [[ "$INPUT_PLATFORM" == *"CoreSight ETM"* ]]; then
+    KERNEL_REPO="https://github.com/2254061909/android_kernel_xiaomi_sm8450.git"
+    SOURCE_NAME="2254061909 fork (coresight-etm branch)"
+    SOURCE_SLUG="2254061909-coresight-etm"
+  else
+    KERNEL_REPO="https://github.com/Ingres-Centre/android_kernel_xiaomi_sm8450.git"
+  fi
   MODULES_REPO=""
   KERNEL_CLONE_DIR="${SOC}"
   MODULES_CLONE_DIR=""
@@ -154,7 +170,12 @@ fi
 # ---- Branch resolution -------------------------------------------------------
 if [[ "$INPUT_BRANCH_MODE" == "Use the recommended branch automatically" ]]; then
   if [[ "$SOURCE_LAYOUT" == "ingres-flat" ]]; then
-    KERNEL_BRANCH="lineage-23.0"
+    # CoreSight ETM variant uses coresight-etm branch; original uses lineage-23.0
+    if [[ "$INPUT_PLATFORM" == *"CoreSight ETM"* ]]; then
+      KERNEL_BRANCH="coresight-etm"
+    else
+      KERNEL_BRANCH="lineage-23.0"
+    fi
   else
     KERNEL_BRANCH="$(git ls-remote --symref "$KERNEL_REPO" HEAD | awk '/^ref:/ {sub("refs/heads/","",$2); print $2; exit}')"
   fi
@@ -183,7 +204,7 @@ if [[ -z "$CLANG_VERSION" ]]; then
       CLANG_VERSION="clang-r536225" ;;
     lineage-23.0*)
       CLANG_VERSION="clang-r547379" ;;
-    16.0|lineage-23*|oneplus/*_b_16*|oneplus_*_b_16*)
+    16.0|lineage-23*|oneplus/*_b_16*|oneplus_*_b_16*|coresight-etm*)
       CLANG_VERSION="clang-r563880c" ;;
     *)
       CLANG_VERSION="clang-r563880c"
