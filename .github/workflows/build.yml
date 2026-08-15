@@ -12,6 +12,7 @@ on:
         default: Xiaomi ingres (SM8450 / Redmi K50G / POCO F4 GT)
         options:
           - Xiaomi ingres (SM8450 / Redmi K50G / POCO F4 GT)
+          - Xiaomi ingres + CoreSight ETM (SM8450 / custom fork)
           - Snapdragon 8 Gen 1 (SM8450 / OnePlus 10T / Ace Pro)
           - Snapdragon 8 Gen 2 (SM8550 / OnePlus 11 / 12R)
           - Snapdragon 8 Gen 3 (SM8650 / OnePlus 12)
@@ -242,11 +243,6 @@ jobs:
       - name: Make AnyKernel3 zip
         run: bash scripts/make-anykernel-zip.sh
 
-      # Only what is actually needed to flash:
-      #   Image            -> the kernel to put into boot.img (KPM-patched)
-      #   Image.unpatched  -> same kernel without the KPM patch, the fallback
-      #   *.zip            -> AnyKernel3 flashable package
-      # build.log is kept because a failed build is unreadable without it.
       - name: Upload build artifacts
         if: always()
         uses: actions/upload-artifact@v4
