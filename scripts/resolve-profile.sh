@@ -25,15 +25,6 @@ case "$INPUT_PLATFORM" in
     OFFICIAL_GKI_FRAGMENT="arch/arm64/configs/vendor/ingres_GKI.config"
     RECOMMENDED_SOURCE="IngresCentre"
     ;;
-  "Xiaomi ingres + CoreSight ETM (SM8450 / custom fork)")
-    SOC="sm8450"
-    PLATFORM_SLUG="ingres"
-    PLATFORM_NAME="Xiaomi ingres + CoreSight ETM (SM8450)"
-    BUILD_CONFIGS="vendor/waipio_GKI.config vendor/xiaomi_GKI.config vendor/ingres_GKI.config vendor/debugfs.config"
-    OFFICIAL_BUILD_TARGET="waipio"
-    OFFICIAL_GKI_FRAGMENT="arch/arm64/configs/vendor/ingres_GKI.config"
-    RECOMMENDED_SOURCE="IngresCentre"
-    ;;
   "Snapdragon 8 Gen 1 (SM8450 / OnePlus 10T / Ace Pro)")
     SOC="sm8450"
     PLATFORM_SLUG="8gen1"
@@ -144,14 +135,7 @@ SUSFS_PATCH_FILE=""
 
 # ---- Repo layout -------------------------------------------------------------
 if [[ "$SOURCE_LAYOUT" == "ingres-flat" ]]; then
-  # Check if this is the CoreSight ETM variant and point to the custom fork
-  if [[ "$INPUT_PLATFORM" == *"CoreSight ETM"* ]]; then
-    KERNEL_REPO="https://github.com/2254061909/android_kernel_xiaomi_sm8450.git"
-    SOURCE_NAME="2254061909 fork (coresight-etm branch)"
-    SOURCE_SLUG="2254061909-coresight-etm"
-  else
-    KERNEL_REPO="https://github.com/Ingres-Centre/android_kernel_xiaomi_sm8450.git"
-  fi
+  KERNEL_REPO="https://github.com/Ingres-Centre/android_kernel_xiaomi_sm8450.git"
   MODULES_REPO=""
   KERNEL_CLONE_DIR="${SOC}"
   MODULES_CLONE_DIR=""
@@ -170,12 +154,7 @@ fi
 # ---- Branch resolution -------------------------------------------------------
 if [[ "$INPUT_BRANCH_MODE" == "Use the recommended branch automatically" ]]; then
   if [[ "$SOURCE_LAYOUT" == "ingres-flat" ]]; then
-    # CoreSight ETM variant uses coresight-etm branch; original uses lineage-23.0
-    if [[ "$INPUT_PLATFORM" == *"CoreSight ETM"* ]]; then
-      KERNEL_BRANCH="coresight-etm"
-    else
-      KERNEL_BRANCH="lineage-23.0"
-    fi
+    KERNEL_BRANCH="lineage-23.0"
   else
     KERNEL_BRANCH="$(git ls-remote --symref "$KERNEL_REPO" HEAD | awk '/^ref:/ {sub("refs/heads/","",$2); print $2; exit}')"
   fi
@@ -204,7 +183,7 @@ if [[ -z "$CLANG_VERSION" ]]; then
       CLANG_VERSION="clang-r536225" ;;
     lineage-23.0*)
       CLANG_VERSION="clang-r547379" ;;
-    16.0|lineage-23*|oneplus/*_b_16*|oneplus_*_b_16*|coresight-etm*)
+    16.0|lineage-23*|oneplus/*_b_16*|oneplus_*_b_16*)
       CLANG_VERSION="clang-r563880c" ;;
     *)
       CLANG_VERSION="clang-r563880c"
